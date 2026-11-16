@@ -17,7 +17,10 @@
 #[doc = include_str!("../README.md")]
 struct ReadmeExamples;
 
+mod anld;
+mod comments;
 mod crypt;
+mod dop;
 mod drawing;
 mod fib;
 mod fkp;
@@ -44,6 +47,7 @@ use craft_wordmodel::para::Run;
 use craft_wordmodel::props::CharProps;
 use craft_wordmodel::props::NumRef;
 use craft_wordmodel::section::HeaderSet;
+use craft_wordmodel::section::SectionProps;
 use craft_wordmodel::styles::StyleSheet;
 use craft_wordmodel::{Document, PartKind};
 
@@ -279,6 +283,9 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
     // Word opens Word 97-2003 files in compatibility mode 11 (Word 2003); the model's default
     // 15 would apply Word 2013+ justification and line-breaking rules to them.
     doc.settings.compat_mode = 11;
+    if let Some((f, l)) = fib.pair(fib::pair::DOP) {
+        dop::read(table.get(f as usize..(f as usize).saturating_add(l as usize)).unwrap_or_default(), false, &mut doc.settings);
+    }
     if let Some(core) = metadata::read(&comp) {
         doc.core = core;
     }
@@ -349,84 +356,28 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
     drawn.sort_by_key(|(cp, _)| *cp);
     let ctx = WalkCtx { drawn: &drawn, ..ctx };
 
-    // Header and footer parts: skip the six separator stories, then six stories per section
-    // in the order even header, odd (default) header, even footer, odd (default) footer,
-    // first header, first footer. Empty stories inherit from the previous section.
-    let mut hf_ids: Vec<(usize, usize, u32)> = Vec::new();
-    for si in 0..sects.len() {
-        for k in 0..6usize {
-            let Some(&ab) = stories.get(6 + si * 6 + k) else { break };
-            let Some((a, b)) = story(hdd_base, fib.ccp.hdd, ab) else { continue };
-            if doc.parts.len() >= MAX_PARTS {
-                continue;
-            }
-            let kind = match k {
-                0 | 1 | 4 => PartKind::Header,
-                _ => PartKind::Footer,
-            };
-            let blocks = header_story_blocks(&ctx, a, b, &mut pics, max_paragraphs)?;
-            if !blocks.is_empty() {
-                let id = doc.add_part(kind, blocks);
-                hf_ids.push((si, k, id));
-            }
-        }
-    }
+    let hf_ids = header_parts(&ctx, &mut doc, sects.len(), &stories, (hdd_base, fib.ccp.hdd), &mut pics, max_paragraphs)?;
+    note_separators(&ctx, &mut doc, &stories, (hdd_base, fib.ccp.hdd), &mut pics, max_paragraphs)?;
 
     // Footnote and endnote stories: each text range becomes a part; the reference CPs then
     // link to the part ids during the main walk.
-    let mut note_links: Vec<(u32, NoteKind, u32)> = Vec::new();
-    for (cp, ab) in notes::parse_notes(&table, &fib, fib::pair::PLCF_FND_REF, fib::pair::PLCF_FND_TXT) {
-        let Some((a, b)) = story(ftn_base, fib.ccp.ftn, ab) else { continue };
-        let blocks = story_blocks(&ctx, a, b, &mut pics, max_paragraphs)?;
-        if !blocks.is_empty() && doc.parts.len() < MAX_PARTS {
-            let id = doc.add_part(PartKind::Footnote, blocks);
-            note_links.push((cp, NoteKind::Footnote, id));
-        }
-    }
-    for (cp, ab) in notes::parse_notes(&table, &fib, fib::pair::PLCF_END_REF, fib::pair::PLCF_END_TXT) {
-        let Some((a, b)) = story(edn_base, fib.ccp.edn, ab) else { continue };
-        let blocks = story_blocks(&ctx, a, b, &mut pics, max_paragraphs)?;
-        if !blocks.is_empty() && doc.parts.len() < MAX_PARTS {
-            let id = doc.add_part(PartKind::Endnote, blocks);
-            note_links.push((cp, NoteKind::Endnote, id));
-        }
-    }
+    let mut note_links: Vec<NoteLink> = Vec::new();
+    let footnotes = notes::parse_notes(&table, &fib, fib::pair::PLCF_FND_REF, fib::pair::PLCF_FND_TXT);
+    note_parts(&ctx, &mut doc, &footnotes, (ftn_base, fib.ccp.ftn), NoteKind::Footnote, &mut note_links, &mut pics, max_paragraphs)?;
+    let endnotes = notes::parse_notes(&table, &fib, fib::pair::PLCF_END_REF, fib::pair::PLCF_END_TXT);
+    note_parts(&ctx, &mut doc, &endnotes, (edn_base, fib.ccp.edn), NoteKind::Endnote, &mut note_links, &mut pics, max_paragraphs)?;
     // Sorted so the main walk finds each reference by binary search.
-    note_links.sort_by_key(|(cp, _, _)| *cp);
-    let marks = notes::parse_bookmarks(&table, &fib);
+    note_links.sort_by_key(|l| l.cp);
+    let mut marks = notes::parse_bookmarks(&table, &fib, comments::Layout::Word97);
+    let atn_base = hdd_base.saturating_add(fib.ccp.hdd);
+    let comments = comments::parse(&table, &fib, comments::Layout::Word97);
+    comment_parts(&ctx, &mut doc, comments, (atn_base, fib.ccp.atn), &mut marks, &mut pics, max_paragraphs)?;
     let mut sect_ends: Vec<u32> = sects.iter().map(|s| s.end_cp).collect();
     sect_ends.sort_unstable();
     let ctx = WalkCtx { notes: &note_links, marks: &marks, sect_ends: &sect_ends, ..ctx };
 
-    // Sections: each section's properties attach to the paragraph that ends it (its story of
-    // header/footer parts included); the section reaching the end of the text is the final one.
     let mut paras = walk(&ctx, 0, fib.ccp.text, &mut pics);
-    // The first paragraph ending at each CP, found once rather than by a scan per section.
-    let mut ending: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
-    for (i, p) in paras.iter().enumerate() {
-        ending.entry(p.end_cp).or_insert(i);
-    }
-    let last = sects.last().map(|s| s.props.clone());
-    for (si, sec) in sects.iter().enumerate() {
-        let mut props = sec.props.clone();
-        let id_of = |k: usize| hf_ids.iter().find(|(s, kk, _)| *s == si && *kk == k).map(|(_, _, id)| *id);
-        props.headers = HeaderSet { even: id_of(0), default: id_of(1), first: id_of(4) };
-        props.footers = HeaderSet { even: id_of(2), default: id_of(3), first: id_of(5) };
-        let is_final = si + 1 == sects.len() || sec.end_cp >= fib.ccp.text;
-        if is_final {
-            continue; // handled below through `last`
-        }
-        if let Some(p) = ending.get(&sec.end_cp).and_then(|&i| paras.get_mut(i)) {
-            p.para.section = Some(Box::new(props));
-        }
-    }
-    if let Some(mut l) = last {
-        let si = sects.len().saturating_sub(1);
-        let id_of = |k: usize| hf_ids.iter().find(|(s, kk, _)| *s == si && *kk == k).map(|(_, _, id)| *id);
-        l.headers = HeaderSet { even: id_of(0), default: id_of(1), first: id_of(4) };
-        l.footers = HeaderSet { even: id_of(2), default: id_of(3), first: id_of(5) };
-        doc.last_section = l;
-    }
+    attach_sections(&mut doc, &mut paras, &sects, &hf_ids, fib.ccp.text);
 
     if paragraphs.exceeded.get() {
         return Err(paragraph_limit(max_paragraphs));
@@ -438,16 +389,17 @@ fn read_limited(bytes: &[u8], password: Option<&str>, max_paragraphs: usize) -> 
     Ok(doc)
 }
 
-/// Read a Word 6.0/95 file ([`word6`]): its main text, with its character and paragraph
-/// formatting and table rows translated to Word 97 sprms, through the same walk as a Word 97 file.
-/// Its paragraph styles are read too; character styles and the other stories are not yet, and a
-/// section mark reads as a page break.
+/// Read a Word 6.0/95 file ([`word6`]): its text, with its character and paragraph formatting and
+/// table rows translated to Word 97 sprms, through the same walk as a Word 97 file. Its styles,
+/// sections, headers and footers, notes and comments are read as a Word 97 file's, from the
+/// structures [`word6`] puts in the Word 97 shape (and [`comments`] reads in their Word 6 shape).
 fn read_word6(comp: &craft_cfb::CompoundFile<'_>, word: &[u8], max_paragraphs: usize) -> Result<Document, DocbinError> {
     let fib = word6::Fib6::parse(word)?;
     let content = word6::content(word, &fib)?;
     let mut doc = Document::new();
     // Word opens these files in compatibility mode 11 too.
     doc.settings.compat_mode = 11;
+    dop::read(fib.dop(word), true, &mut doc.settings);
     if let Some(core) = metadata::read(comp) {
         doc.core = core;
     }
@@ -462,7 +414,8 @@ fn read_word6(comp: &craft_cfb::CompoundFile<'_>, word: &[u8], max_paragraphs: u
     let mut pics = media::Pictures::for_input(word.len());
     let ctx = WalkCtx {
         word,
-        data: &[],
+        // No Data stream: the pictures' PICFs are in the WordDocument stream.
+        data: word,
         pieces: &content.pieces,
         chpx_bins: &content.chpx,
         papx_bins: &content.papx,
@@ -477,14 +430,249 @@ fn read_word6(comp: &craft_cfb::CompoundFile<'_>, word: &[u8], max_paragraphs: u
         paragraphs: &paragraphs,
         work: &work,
     };
-    let paras = walk(&ctx, 0, fib.ccp_text, &mut pics);
+    // The stories follow the main text in this order (macros never seen, but counted).
+    let ftn_base = fib.ccp_text;
+    let hdd_base = ftn_base.saturating_add(fib.ccp_ftn);
+    let edn_base = hdd_base.saturating_add(fib.ccp_hdd).saturating_add(fib.ccp_mcr).saturating_add(fib.ccp_atn);
+    let fib97 = fib.as_word97();
+    // Each section's heading numbering, by its end.
+    let olsts = std::cell::RefCell::new(Vec::new());
+    // A section's sprms, translated; in a fast-saved file the piece holding its section mark can
+    // add more (Word 95 records a change to the section there), applied after the SEPX's.
+    let sects = sections::parse_with(word, word, &fib97, |grpprl, end_cp| {
+        olsts.borrow_mut().push((end_cp, word6::olst(grpprl)));
+        let mut sprms = word6::translate_sep(grpprl);
+        sprms.extend(prm_sprms(content.pieces.piece_prm(end_cp.saturating_sub(1)), &work, |sgc| sgc == 4));
+        sprms
+    });
+    let stories = word6::header_stories(word, &fib, sects.iter().map(|s| s.grpf_ihdt));
+    let hf_ids = header_parts(&ctx, &mut doc, sects.len(), &stories, (hdd_base, fib.ccp_hdd), &mut pics, max_paragraphs)?;
+    note_separators(&ctx, &mut doc, &stories, (hdd_base, fib.ccp_hdd), &mut pics, max_paragraphs)?;
+    let mut note_links: Vec<NoteLink> = Vec::new();
+    let footnotes = notes::parse_notes(word, &fib97, fib::pair::PLCF_FND_REF, fib::pair::PLCF_FND_TXT);
+    note_parts(&ctx, &mut doc, &footnotes, (ftn_base, fib.ccp_ftn), NoteKind::Footnote, &mut note_links, &mut pics, max_paragraphs)?;
+    let endnotes = notes::parse_notes(word, &fib97, fib::pair::PLCF_END_REF, fib::pair::PLCF_END_TXT);
+    note_parts(&ctx, &mut doc, &endnotes, (edn_base, fib.ccp_edn), NoteKind::Endnote, &mut note_links, &mut pics, max_paragraphs)?;
+    note_links.sort_by_key(|l| l.cp);
+    let mut marks = notes::parse_bookmarks(word, &fib97, comments::Layout::Word6(content.pieces.default_code_page()));
+    let atn_base = hdd_base.saturating_add(fib.ccp_hdd).saturating_add(fib.ccp_mcr);
+    let comments = comments::parse(word, &fib97, comments::Layout::Word6(content.pieces.default_code_page()));
+    comment_parts(&ctx, &mut doc, comments, (atn_base, fib.ccp_atn), &mut marks, &mut pics, max_paragraphs)?;
+    let mut sect_ends: Vec<u32> = sects.iter().map(|s| s.end_cp).collect();
+    sect_ends.sort_unstable();
+    let ctx = WalkCtx { notes: &note_links, marks: &marks, sect_ends: &sect_ends, ..ctx };
+    let mut paras = walk(&ctx, 0, fib.ccp_text, &mut pics);
+    attach_sections(&mut doc, &mut paras, &sects, &hf_ids, fib.ccp_text);
     if paragraphs.exceeded.get() {
         return Err(paragraph_limit(max_paragraphs));
     }
+    if !content.lists.is_empty() {
+        let mut olsts = olsts.into_inner();
+        olsts.sort_by_key(|o| o.0);
+        // A paragraph's mark: its FC finds its numbering sprms, its CP its section.
+        let mark = |p: &ParaOut| p.end_cp.saturating_sub(1);
+        let own_of = |p: &ParaOut| {
+            let fc = content.pieces.fc_of_cp(mark(p)).unwrap_or(0);
+            // A Prm1 on the mark's piece names the Prc a fast save recorded its change in.
+            let prc = content.pieces.span(mark(p)).map(|s| s.prm()).filter(|prm| prm & 1 == 1).map(|prm| usize::from(prm >> 1));
+            content.lists.at(fc, content.papx.papx(word, fc).0, prc)
+        };
+        let olst_of = |p: &ParaOut| olsts.get(olsts.partition_point(|o| o.0 <= mark(p))).and_then(|o| o.1.as_ref());
+        let section_mark = |p: &ParaOut| p.para.text.is_empty() && sect_ends.binary_search(&p.end_cp).is_ok();
+        doc.numbering = Arc::new(anld::number(&mut paras, own_of, olst_of, section_mark, &content.fonts, content.pieces.default_code_page()));
+    }
+    doc.media.extend(pics.media);
     doc.body = table::assemble(paras);
     doc.ensure_nonempty();
     work.log();
     Ok(doc)
+}
+
+/// Header and footer parts from the header subdocument's stories, `stories` in the shape of
+/// [`sections::header_stories`]: six separator stories (skipped), then six per section in the
+/// order even header, odd (default) header, even footer, odd (default) footer, first header, first
+/// footer. An empty story makes no part, so the section takes the previous section's. `hdd` is the
+/// subdocument's first CP and length. Returns (section, slot, part id) for each part made.
+fn header_parts(
+    ctx: &WalkCtx<'_>,
+    doc: &mut Document,
+    sections: usize,
+    stories: &[(u32, u32)],
+    (hdd_base, ccp_hdd): (u32, u32),
+    pics: &mut media::Pictures,
+    max_paragraphs: usize,
+) -> Result<Vec<(usize, usize, u32)>, DocbinError> {
+    let mut hf_ids = Vec::new();
+    for si in 0..sections {
+        for k in 0..6usize {
+            let Some(&ab) = stories.get(6 + si * 6 + k) else { break };
+            let Some((a, b)) = story(hdd_base, ccp_hdd, ab) else { continue };
+            if doc.parts.len() >= MAX_PARTS {
+                continue;
+            }
+            let kind = match k {
+                0 | 1 | 4 => PartKind::Header,
+                _ => PartKind::Footer,
+            };
+            let blocks = header_story_blocks(ctx, a, b, pics, max_paragraphs)?;
+            if !blocks.is_empty() {
+                let id = doc.add_part(kind, blocks);
+                hf_ids.push((si, k, id));
+            }
+        }
+    }
+    Ok(hf_ids)
+}
+
+/// A comment part and a `Document::comments` entry for each comment, and its range as marks the
+/// main walk turns into [`InlineObject::CommentStart`] and [`InlineObject::CommentEnd`]; a
+/// comment without a range covers its reference character's place, as Word shows it.
+fn comment_parts(
+    ctx: &WalkCtx<'_>,
+    doc: &mut Document,
+    comments: Vec<comments::RawComment>,
+    (base, len): (u32, u32),
+    marks: &mut Vec<(u32, notes::Mark)>,
+    pics: &mut media::Pictures,
+    max_paragraphs: usize,
+) -> Result<(), DocbinError> {
+    for c in comments {
+        let Some((a, b)) = story(base, len, c.story) else { continue };
+        let blocks = story_blocks(ctx, a, b, pics, max_paragraphs)?;
+        if doc.parts.len() >= MAX_PARTS {
+            continue;
+        }
+        let part = doc.add_part(PartKind::Comment, blocks);
+        let id = doc.comments.len() as u32;
+        doc.comments.insert(id, craft_wordmodel::Comment { author: c.author, initials: c.initials, date: c.date, part, ..Default::default() });
+        let (start, end) = c.range.unwrap_or((c.cp, c.cp));
+        marks.push((start, notes::Mark::CommentStart(id)));
+        marks.push((end, notes::Mark::CommentEnd(id)));
+    }
+    notes::sort_marks(marks);
+    Ok(())
+}
+
+/// The document's footnote and endnote separators: the header table's first six stories are the
+/// footnotes' separator, continuation separator and continuation notice, then the endnotes'
+/// ([MS-DOC] §2.9.155). Word writes its default lines as stories too (a 0x03 or 0x04 character),
+/// and the `.docx` reader keeps those as well; an empty story is the default.
+fn note_separators(
+    ctx: &WalkCtx<'_>,
+    doc: &mut Document,
+    stories: &[(u32, u32)],
+    (hdd_base, ccp_hdd): (u32, u32),
+    pics: &mut media::Pictures,
+    max_paragraphs: usize,
+) -> Result<(), DocbinError> {
+    for (k, &ab) in stories.iter().take(6).enumerate() {
+        let Some((a, b)) = story(hdd_base, ccp_hdd, ab) else { continue };
+        let blocks = header_story_blocks(ctx, a, b, pics, max_paragraphs)?;
+        if blocks.is_empty() {
+            continue;
+        }
+        let seps = if k < 3 { &mut doc.footnote_separators } else { &mut doc.endnote_separators };
+        let slot = match k % 3 {
+            0 => &mut seps.separator,
+            1 => &mut seps.continuation_separator,
+            _ => &mut seps.continuation_notice,
+        };
+        *slot = Some(blocks);
+    }
+    Ok(())
+}
+
+/// A note reference the main walk turns into an [`InlineObject::NoteRef`]: at `cp`, the note part
+/// `id`, and for a custom mark its text and the CP after it (the mark's characters are the
+/// reference, not body text).
+struct NoteLink {
+    cp: u32,
+    kind: NoteKind,
+    id: u32,
+    custom: Option<(String, u32)>,
+}
+
+/// Most characters a custom note mark is read for (Word takes no more than 10).
+const MAX_MARK: usize = 10;
+
+/// A custom note mark at `cp`: its characters up to the end of their character run, as Word reads
+/// a mark (`ab` reads as one mark, the space after it, formatted apart, as text), and the CP
+/// after them.
+fn custom_mark(ctx: &WalkCtx<'_>, cp: u32) -> Option<(String, u32)> {
+    let fc_of = |cp: u32| ctx.pieces.fc_of_cp(cp);
+    let run = ctx.chpx_bins.chpx_run(ctx.word, fc_of(cp)?);
+    let mut mark = String::new();
+    let mut at = cp;
+    while mark.chars().count() < MAX_MARK && fc_of(at).is_some_and(|fc| run.contains(fc)) {
+        let Ok((c, units)) = ctx.pieces.char_at(ctx.word, at) else { break };
+        if (c as u32) < 0x20 {
+            break;
+        }
+        // A symbol character is the placeholder U+0028 with sprmCSymbol naming it, as in the
+        // text; the mark keeps the character (it has no font of its own).
+        let symbol = (c == '(').then(|| fc_of(at).and_then(|fc| symbol_operand(ctx.chpx_bins.chpx(ctx.word, fc)))).flatten();
+        let c = symbol.and_then(|(_, xchar)| char::from_u32(u32::from(xchar))).unwrap_or(c);
+        mark.push(c);
+        at = at.saturating_add(units.max(1));
+    }
+    (!mark.is_empty()).then_some((mark, at))
+}
+
+/// A part for each footnote or endnote story of `notes` (story ranges within the subdocument at
+/// `base` of `len` CPs), each linked from its reference CP in `links`.
+#[allow(clippy::too_many_arguments)]
+fn note_parts(
+    ctx: &WalkCtx<'_>,
+    doc: &mut Document,
+    notes: &[notes::Note],
+    (base, len): (u32, u32),
+    kind: NoteKind,
+    links: &mut Vec<NoteLink>,
+    pics: &mut media::Pictures,
+    max_paragraphs: usize,
+) -> Result<(), DocbinError> {
+    let part = match kind {
+        NoteKind::Footnote => PartKind::Footnote,
+        NoteKind::Endnote => PartKind::Endnote,
+    };
+    for note in notes {
+        let Some((a, b)) = story(base, len, note.story) else { continue };
+        let blocks = story_blocks(ctx, a, b, pics, max_paragraphs)?;
+        if !blocks.is_empty() && doc.parts.len() < MAX_PARTS {
+            let id = doc.add_part(part, blocks);
+            let custom = if note.custom { custom_mark(ctx, note.cp) } else { None };
+            links.push(NoteLink { cp: note.cp, kind, id, custom });
+        }
+    }
+    Ok(())
+}
+
+/// Each section's properties (its header and footer parts included) go on the paragraph that ends
+/// it; the section reaching the end of the main text (`ccp_text`) is the document's last section.
+fn attach_sections(doc: &mut Document, paras: &mut [table::ParaOut], sects: &[sections::Section], hf_ids: &[(usize, usize, u32)], ccp_text: u32) {
+    // The first paragraph ending at each CP, found once rather than by a scan per section.
+    let mut ending: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (i, p) in paras.iter().enumerate() {
+        ending.entry(p.end_cp).or_insert(i);
+    }
+    let with_parts = |si: usize, props: &SectionProps| {
+        let mut props = props.clone();
+        let id_of = |k: usize| hf_ids.iter().find(|(s, kk, _)| *s == si && *kk == k).map(|(_, _, id)| *id);
+        props.headers = HeaderSet { even: id_of(0), default: id_of(1), first: id_of(4) };
+        props.footers = HeaderSet { even: id_of(2), default: id_of(3), first: id_of(5) };
+        props
+    };
+    // The final section is the first that reaches the end of the main text (in a malformed
+    // PlcfSed, sections after it are ignored), else the last one.
+    let final_si = sects.iter().position(|s| s.end_cp >= ccp_text).unwrap_or(sects.len().saturating_sub(1));
+    for (si, sec) in sects.iter().enumerate().take(final_si) {
+        if let Some(p) = ending.get(&sec.end_cp).and_then(|&i| paras.get_mut(i)) {
+            p.para.section = Some(Box::new(with_parts(si, &sec.props)));
+        }
+    }
+    if let Some(last) = sects.get(final_si) {
+        doc.last_section = with_parts(final_si, &last.props);
+    }
 }
 
 fn paragraph_limit(max_paragraphs: usize) -> DocbinError {
@@ -558,7 +746,7 @@ struct WalkCtx<'a> {
     raw_styles: &'a [stsh::RawStyle],
     sheet: &'a StyleSheet,
     /// (reference CP in the main document, kind, part id) for notes.
-    notes: &'a [(u32, NoteKind, u32)],
+    notes: &'a [NoteLink],
     /// Bookmark boundaries (main-document CPs), sorted for a sequential walk.
     marks: &'a [(u32, notes::Mark)],
     /// Floating shapes and pictures by anchor CP (absolute), sorted.
@@ -611,6 +799,10 @@ struct ParaBuild {
     run_gen: Option<u64>,
     /// Inline objects, each anchored at a U+FFFC pushed into `text`.
     objects: Vec<InlineObject>,
+    /// The paragraph style its runs' formatting builds on, read ahead from the paragraph's mark
+    /// when its first formatted character is read (`None` until then): `props.style` is only
+    /// set when the walk reaches the mark.
+    run_style: Option<Option<String>>,
 }
 
 impl ParaBuild {
@@ -664,7 +856,7 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
     // Field assembly state: instruction characters are swallowed, the result is kept until
     // the end character, then emitted as one object (hyperlinks keep their result text).
     let mut field: Option<FieldBuild> = None;
-    let mut fmt = FmtState::default();
+    let mut fmt = FmtState { walk_end: cp_end, ..FmtState::default() };
     while cp < cp_end {
         // Bookmark boundaries at this CP (main-document walks only; subdocument walks get
         // an empty table and `cp` never matches the main-document CPs).
@@ -672,12 +864,8 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
         // blocking every later one.
         while marks.peek().is_some_and(|&(mcp, _)| *mcp <= cp) {
             if let Some((_, m)) = marks.next() {
-                let obj = match m {
-                    notes::Mark::Start(name) => InlineObject::BookmarkStart { name: name.clone() },
-                    notes::Mark::End(name) => InlineObject::BookmarkEnd { name: name.clone() },
-                };
                 pb.push('\u{FFFC}', CharProps::default());
-                pb.objects.push(obj);
+                pb.objects.push(mark_object(m));
             }
         }
         let (c, units) = match ctx.pieces.char_at(ctx.word, cp) {
@@ -693,6 +881,15 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
             break;
         }
         ctx.budget.set(ctx.budget.get() - 1);
+        // A note with a custom mark: the mark's characters are its reference.
+        if let Some(link) = ctx.notes.get(ctx.notes.partition_point(|l| l.cp < cp)).filter(|l| l.cp == cp)
+            && let Some((mark, after)) = &link.custom
+        {
+            pb.push('\u{FFFC}', CharProps::default());
+            pb.objects.push(InlineObject::NoteRef { kind: link.kind, id: link.id, custom: mark.clone() });
+            cp = (*after).max(cp.saturating_add(1));
+            continue;
+        }
         // A section mark (0x0C) at a section's end is that section's last paragraph mark.
         let section_mark = c == '\u{C}' && ctx.sect_ends.binary_search(&cp.saturating_add(1)).is_ok();
         match c {
@@ -718,9 +915,7 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                     combined = v;
                     &combined
                 };
-                if let Some(st) = ctx.raw_styles.get(istd as usize).filter(|s| !s.name.is_empty()) {
-                    pb.props.style = Some(fmt::style_id(&st.name));
-                }
+                pb.props.style = style_of(ctx, istd);
                 let mut row = table::decode(papx);
                 row.cell_mark = c == '\u{7}';
                 // Only table marks keep their table context; a plain paragraph would carry
@@ -741,8 +936,13 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
                         continue;
                     }
                     if prl.sgc() == 1 {
-                        fmt::apply_para(&mut pb.props, &prl);
+                        apply_para_prl(ctx.sheet, &mut pb.props, &prl);
                     }
+                }
+                // In a table, the frame sprms place the table (Word 2016 reads them as its
+                // `w:tblpPr`), not the paragraphs in its cells.
+                if row.is_some() {
+                    pb.props.frame = None;
                 }
                 if let Some(num) = num_of(ilfo) {
                     pb.props.numbering = Some(NumRef { num, level: ilvl });
@@ -835,11 +1035,16 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
             }
             '\u{2}' => {
                 // Footnote or endnote reference; custom symbols share the same character.
-                let at = ctx.notes.partition_point(|(c, _, _)| *c < cp);
-                if let Some((_, kind, id)) = ctx.notes.get(at).filter(|(c, _, _)| *c == cp) {
+                let at = ctx.notes.partition_point(|l| l.cp < cp);
+                if let Some(link) = ctx.notes.get(at).filter(|l| l.cp == cp) {
                     pb.push('\u{FFFC}', CharProps::default());
-                    pb.objects.push(InlineObject::NoteRef { kind: *kind, id: *id, custom: String::new() });
+                    pb.objects.push(InlineObject::NoteRef { kind: link.kind, id: link.id, custom: String::new() });
                 }
+            }
+            // A note separator's line (0x03) and the continuation separator's (0x04).
+            '\u{3}' | '\u{4}' => {
+                pb.push('\u{FFFC}', CharProps::default());
+                pb.objects.push(InlineObject::note_separator(c == '\u{4}'));
             }
             '\t' => push_formatted(&mut pb, cp, '\t', ctx, field.as_mut(), &mut fmt),
             '\u{B}' => push_formatted(&mut pb, cp, '\n', ctx, field.as_mut(), &mut fmt),
@@ -854,6 +1059,7 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
         }
         cp = cp.saturating_add(units);
     }
+    close_marks(marks.take_while(|&&(mcp, _)| mcp <= cp_end), &mut out, &mut pb);
     if !pb.text.is_empty() {
         let done = pb;
         out.push(ParaOut {
@@ -863,6 +1069,40 @@ fn walk<'a>(ctx: &WalkCtx<'a>, cp_start: u32, cp_end: u32, pics: &mut media::Pic
         });
     }
     out
+}
+
+/// Boundaries left at the end of a walk (a range ending after the last paragraph mark): they
+/// close in the last paragraph, as Word ends them, not in one of their own; with text after the
+/// last mark, in that text.
+fn close_marks<'m>(marks: impl Iterator<Item = &'m (u32, notes::Mark)>, out: &mut [ParaOut], pb: &mut ParaBuild) {
+    for (_, m) in marks {
+        match out.last_mut().filter(|_| pb.text.is_empty()) {
+            Some(last) => {
+                let p = &mut last.para;
+                let len = '\u{FFFC}'.len_utf8();
+                match p.runs.last_mut() {
+                    Some(r) if r.props == CharProps::default() => r.len += len,
+                    _ => p.runs.push(Run { len, props: CharProps::default() }),
+                }
+                p.text.push('\u{FFFC}');
+                p.objects.push(mark_object(m));
+            }
+            None => {
+                pb.push('\u{FFFC}', CharProps::default());
+                pb.objects.push(mark_object(m));
+            }
+        }
+    }
+}
+
+/// The inline object a bookmark or comment boundary becomes.
+fn mark_object(m: &notes::Mark) -> InlineObject {
+    match m {
+        notes::Mark::Start(name) => InlineObject::BookmarkStart { name: name.clone() },
+        notes::Mark::End(name) => InlineObject::BookmarkEnd { name: name.clone() },
+        notes::Mark::CommentStart(id) => InlineObject::CommentStart { id: *id },
+        notes::Mark::CommentEnd(id) => InlineObject::CommentEnd { id: *id },
+    }
 }
 
 /// Field assembly: `instr` collects everything before the separator (nested fields
@@ -1000,19 +1240,53 @@ fn push_formatted<'a>(pb: &mut ParaBuild, cp: u32, c: char, ctx: &WalkCtx<'a>, f
     };
     let grpprl = run.grpprl;
     let prm = span.map_or(0, |s| s.prm());
-    let style = pb.props.style.as_deref();
+    if pb.run_style.is_none() {
+        pb.run_style = Some(style_ahead(ctx, cp, st.walk_end));
+    }
+    let style = pb.run_style.as_ref().and_then(|s| s.as_deref());
     let hit = st.memo.as_ref().is_some_and(|m| std::ptr::eq(m.chpx, grpprl) && m.prm == prm && m.style.as_deref() == style);
     if !hit {
         let default;
-        let base = match style.and_then(|id| ctx.sheet.get(id)) {
+        let para_base = match style.and_then(|id| ctx.sheet.get(id)) {
             Some(sty) => &sty.chr,
             None => {
                 default = CharProps::default();
                 &default
             }
         };
-        let mut props = char_props(grpprl, ctx.fonts, base);
+        // The run's character style, whose formatting joins the paragraph style's as the base of
+        // the run's own sprms (see `fmt::with_char_style`).
+        let prc_style = prc_with_style(ctx.pieces.piece_prm(cp));
+        let char_style = char_style(ctx, prc_style.unwrap_or(grpprl));
+        let combined;
+        let base = match char_style {
+            Some(cs) => {
+                combined = fmt::with_char_style(para_base, &cs.chr);
+                &combined
+            }
+            None => para_base,
+        };
+        // A Prc naming a style resets what the CHPX gave the run, but for what sprmCIstd keeps.
+        let mut props = match prc_style {
+            Some(_) => {
+                let mut kept = base.clone();
+                for prl in sprm::iter(grpprl).filter(|p| p.sgc() == 2 && fmt::kept_by_istd(p.op)) {
+                    fmt::apply_char(&mut kept, &prl, base, ctx.fonts);
+                }
+                kept
+            }
+            None => char_props(grpprl, ctx.fonts, base),
+        };
         apply_prm(&mut props, ctx.pieces.piece_prm(cp), ctx.fonts, base, ctx.work);
+        // Kept as direct formatting: what differs from what the styles give the run, as the model
+        // resolves them (the paragraph style, then the character style over it). A toggle the
+        // styles cancel is kept, since the model overlays them (#1801).
+        let styled = match char_style {
+            Some(cs) => para_base.clone().overlaid(&cs.chr),
+            None => para_base.clone(),
+        };
+        let mut props = props.minus(&styled);
+        props.style = char_style.map(|cs| cs.id.clone());
         st.memo = Some(FmtMemo { chpx: grpprl, prm, style: style.map(str::to_owned), props });
         st.generation += 1;
     }
@@ -1045,6 +1319,62 @@ fn push_formatted<'a>(pb: &mut ParaBuild, cp: u32, c: char, ctx: &WalkCtx<'a>, f
     }
 }
 
+/// A paragraph sprm, applied to the paragraph's own properties. A frame sprm changes the style's
+/// frame, which the paragraph's own replaces whole: the first one starts from the style's.
+fn apply_para_prl(sheet: &StyleSheet, props: &mut craft_wordmodel::props::ParaProps, prl: &sprm::Prl<'_>) {
+    if props.frame.is_none() && fmt::is_frame(prl.op) {
+        props.frame = props.style.as_deref().and_then(|id| sheet.get(id)).and_then(|s| s.para.frame.clone());
+    }
+    fmt::apply_para(props, prl);
+}
+
+/// The model id of paragraph style `istd`, when it names a style.
+fn style_of(ctx: &WalkCtx<'_>, istd: u16) -> Option<String> {
+    ctx.raw_styles.get(usize::from(istd)).filter(|s| !s.name.is_empty()).map(|s| fmt::style_id(&s.name))
+}
+
+/// The style of the paragraph `cp` is in: that of the paragraph mark the walk ends it at (the
+/// first paragraph, cell or section mark from `cp`, before `end`), read as the mark reads it.
+/// A paragraph's runs build their formatting on its style, and a run's toggle operand `0x81`
+/// inverts the style's value, so the style is needed before the mark is reached. The text is
+/// read ahead once per paragraph.
+fn style_ahead(ctx: &WalkCtx<'_>, cp: u32, end: u32) -> Option<String> {
+    let mut at = cp;
+    // No further than the walk may read: past that it stops anyway, and a file whose pieces
+    // repeat a stretch with no paragraph mark can't make this scan run on for it. Each step,
+    // a character or a skipped stretch, counts.
+    let mut left = ctx.budget.get();
+    while at < end {
+        if left == 0 {
+            return None;
+        }
+        left -= 1;
+        match ctx.pieces.char_at(ctx.word, at) {
+            Ok((c, units)) => {
+                let section_mark = c == '\u{C}' && ctx.sect_ends.binary_search(&at.saturating_add(1)).is_ok();
+                if matches!(c, '\r' | '\u{7}') || section_mark {
+                    let (istd, _) = ctx.papx_bins.papx(ctx.word, ctx.pieces.fc_of_cp(at).unwrap_or(0));
+                    return style_of(ctx, istd);
+                }
+                at = at.saturating_add(units.max(1));
+            }
+            Err(next) => at = next,
+        }
+    }
+    None
+}
+
+/// The character style a run's CHPX names (`sprmCIstd`): a named character style other than
+/// Default Paragraph Font, which Word shows as no style. An index naming anything else is ignored.
+fn char_style<'a>(ctx: &WalkCtx<'a>, grpprl: &[u8]) -> Option<&'a craft_wordmodel::styles::Style> {
+    let raw = ctx.raw_styles.get(usize::from(fmt::char_style_istd(grpprl)?))?;
+    if raw.stk != 2 || raw.name.is_empty() {
+        return None;
+    }
+    let id = fmt::style_id(&raw.name);
+    ctx.sheet.get(&id).filter(|s| s.kind == craft_wordmodel::styles::StyleKind::Character && s.id != "Default Paragraph Font")
+}
+
 /// What the walk carries from one character to the next while it resolves formatting: the piece
 /// and the CHPX run the last character was in (so most characters need no search), and the last
 /// formatting resolved.
@@ -1055,6 +1385,8 @@ struct FmtState<'a> {
     memo: Option<FmtMemo<'a>>,
     /// Counts the memo's replacements, so equal values mean the same properties.
     generation: u64,
+    /// The end of the CP range walked, where [`style_ahead`] stops.
+    walk_end: u32,
 }
 
 /// The last character formatting resolved, reused while the CHPX, the piece's Prm and the
@@ -1070,14 +1402,19 @@ struct FmtMemo<'a> {
 }
 
 /// The paragraph and table sprms (sgc 1 and 5) of a piece's Prm, as Prls to append to a
-/// paragraph's PAPX: a Prm0's single sprm, or those of the Prm1's grpprl. A Prm1 grpprl is
-/// charged to `work`, as for [`apply_prm`].
+/// paragraph's PAPX (see [`prm_sprms`]).
 fn prm_paragraph_sprms(prm: PrmRef<'_>, work: &Work) -> Vec<u8> {
+    prm_sprms(prm, work, |sgc| matches!(sgc, 1 | 5))
+}
+
+/// The sprms of a piece's Prm whose sgc `wanted` accepts, as Prls: a Prm0's single sprm, or those
+/// of the Prm1's grpprl. A Prm1 grpprl is charged to `work`, as for [`apply_prm`].
+fn prm_sprms(prm: PrmRef<'_>, work: &Work, wanted: impl Fn(u8) -> bool) -> Vec<u8> {
     let mut out = Vec::new();
     match prm {
         PrmRef::Sprm0 { isprm, val } => {
             if let Some(op) = sprm::from_prm0(isprm)
-                && matches!(Prl { op, operand: &[] }.sgc(), 1 | 5)
+                && wanted(Prl { op, operand: &[] }.sgc())
             {
                 out.extend_from_slice(&op.to_le_bytes());
                 out.push(val);
@@ -1087,7 +1424,7 @@ fn prm_paragraph_sprms(prm: PrmRef<'_>, work: &Work) -> Vec<u8> {
             if !work.charge(g.len() as u64, Cost::Formatting) {
                 return out;
             }
-            for prl in sprm::iter(g).filter(|p| matches!(p.sgc(), 1 | 5)) {
+            for prl in sprm::iter(g).filter(|p| wanted(p.sgc())) {
                 out.extend_from_slice(&prl.op.to_le_bytes());
                 out.extend_from_slice(prl.operand);
             }
@@ -1115,10 +1452,8 @@ fn apply_prm(props: &mut CharProps, prm: PrmRef<'_>, fonts: &[String], base: &Ch
             if !work.charge(g.len() as u64, Cost::Formatting) {
                 return;
             }
-            for prl in sprm::iter(g) {
-                if prl.sgc() == 2 {
-                    fmt::apply_char(props, &prl, base, fonts);
-                }
+            for prl in fmt::after_istd(g) {
+                fmt::apply_char(props, &prl, base, fonts);
             }
         }
         PrmRef::Grpprl(None) => {}
@@ -1128,12 +1463,19 @@ fn apply_prm(props: &mut CharProps, prm: PrmRef<'_>, fonts: &[String], base: &Ch
 /// Character props from a CHPX grpprl applied over `base`.
 fn char_props(grpprl: &[u8], fonts: &[String], base: &CharProps) -> CharProps {
     let mut p = base.clone();
-    for prl in sprm::iter(grpprl) {
-        if prl.sgc() == 2 {
-            fmt::apply_char(&mut p, &prl, base, fonts);
-        }
+    for prl in fmt::after_istd(grpprl) {
+        fmt::apply_char(&mut p, &prl, base, fonts);
     }
     p
+}
+
+/// A piece's Prm1 grpprl, when it names a character style (`sprmCIstd`): applied after the
+/// CHPX, its style is the run's and resets the CHPX's formatting.
+fn prc_with_style<'w>(prm: PrmRef<'w>) -> Option<&'w [u8]> {
+    match prm {
+        PrmRef::Grpprl(Some(g)) if fmt::char_style_istd(g).is_some() => Some(g),
+        _ => None,
+    }
 }
 
 /// Read a root-level stream fully; `None` if it is absent or cannot be read. A stream larger than

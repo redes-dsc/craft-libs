@@ -37,7 +37,7 @@ struct RawLvl {
 
 /// A bullet level's character, with the 0xF000 flag bits stripped and the common
 /// Symbol/Wingdings glyphs mapped to their Unicode equivalents so every font renders them.
-fn bullet_char(c: u16) -> char {
+pub(crate) fn bullet_char(c: u16) -> char {
     match c & 0x0FFF {
         0xB7 => '\u{2022}',        // Symbol bullet
         0xA7 => '\u{25AA}',        // Wingdings small square
@@ -51,7 +51,7 @@ fn bullet_char(c: u16) -> char {
 /// 0x00 to 0x27 run in the order of ST_NumberFormat (decimal, upperRoman … 0x16 decimalZero, 0x17
 /// bullet … 0x25 chineseCounting, 0x26 chineseLegalSimplified, 0x27 chineseCountingThousand);
 /// later codes are drawn as decimal.
-fn num_format(nfc: u8) -> NumFormat {
+pub(crate) fn num_format(nfc: u8) -> NumFormat {
     match nfc {
         0xFF => NumFormat::None,
         0x00..=0x27 => NumFormat::ALL.get(nfc as usize).copied().unwrap_or(NumFormat::Decimal),
