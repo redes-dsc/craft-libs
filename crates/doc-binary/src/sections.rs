@@ -2,18 +2,19 @@
 //! the `Plcfhdd` stories of the header subdocument ([MS-DOC] §2.8.25, §2.9.244).
 
 use craft_wordmodel::section::NumFormat;
-use craft_wordmodel::section::{Columns, SectionProps, SectionStart};
+use craft_wordmodel::section::{SectionProps, SectionStart};
 
 use crate::fib::{Fib, pair};
 use crate::sprm::{self, Prl};
 
 /// Most sections we read.
-const MAX_SECTIONS: usize = 1024;
+pub(crate) const MAX_SECTIONS: usize = 1024;
 
 // Section sprms ([MS-DOC] §2.6.4).
 const S_BKC: u16 = 0x3009;
 const S_TITLE_PAGE: u16 = 0x300A; // sprmSFTitlePage
 const S_CCOLUMNS: u16 = 0x500B;
+const S_DXA_COLUMNS: u16 = 0x900C; // sprmSDxaColumns: the space between evenly spaced columns
 const S_PGN_START: u16 = 0x300C; // sprmSPgnStart
 const S_ORIENTATION: u16 = 0x301D; // sprmSBOrientation
 const S_HDR_TOP: u16 = 0xB017;
@@ -25,15 +26,39 @@ const S_DXA_RIGHT: u16 = 0xB022;
 const S_DYA_TOP: u16 = 0x9023;
 const S_DYA_BOTTOM: u16 = 0x9024;
 const S_DXA_GUTTER: u16 = 0xB025;
+// Footnote and endnote options a section states (Word 2002 and later write them; Word 2016's
+// `.doc` reads back as the section's `w:footnotePr`/`w:endnotePr`).
+const S_FPC: u16 = 0x303B; // sprmSFpc: 2 beneath the text
+const S_RNC_FTN: u16 = 0x303C; // sprmSRncFtn
+const S_RNC_EDN: u16 = 0x303E; // sprmSRncEdn
+const S_N_FTN: u16 = 0x503F; // sprmSNFtn
+const S_NFC_FTN_REF: u16 = 0x5040; // sprmSNfcFtnRef
+const S_N_EDN: u16 = 0x5041; // sprmSNEdn
+const S_NFC_EDN_REF: u16 = 0x5042; // sprmSNfcEdnRef
+/// Which header and footer stories a Word 6.0/95 section has (see
+/// [`crate::word6::header_stories`]): its sprm 0x99, translated to the Word 97 form it would have
+/// (index 0x14, a 1-byte operand). [MS-DOC] lists no sprm at index 0x14, since a Word 97 header
+/// table has a slot for every story, so this one only ever comes from a Word 6.0/95 file.
+const S_GPRF_IHDT: u16 = 0x3014;
 
 /// One section: covers paragraphs up to (excluding) `end_cp`, with its properties.
 pub(crate) struct Section {
     pub(crate) end_cp: u32,
     pub(crate) props: SectionProps,
+    /// The header and footer stories the section names ([`S_GPRF_IHDT`]), 0 when none does: only
+    /// a Word 6.0/95 file's `PlcfHdd` depends on it.
+    pub(crate) grpf_ihdt: u8,
 }
 
 /// Parse `PlcfSed` and each section's `Sepx` grpprl.
 pub(crate) fn parse(word: &[u8], table: &[u8], fib: &Fib) -> Vec<Section> {
+    parse_with(word, table, fib, |grpprl, _| grpprl.to_vec())
+}
+
+/// [`parse`], with each section's Word 97 grpprl made by `sepx` from the stored one and the
+/// section's end CP (a Word 6.0/95 file's sprms are translated, and its section mark's piece can
+/// add more).
+pub(crate) fn parse_with(word: &[u8], table: &[u8], fib: &Fib, sepx: impl Fn(&[u8], u32) -> Vec<u8>) -> Vec<Section> {
     let Some((fc, lcb)) = fib.pair(pair::PLCF_SED) else { return Vec::new() };
     let Some(plc) = table.get(fc as usize..(fc as usize).saturating_add(lcb as usize)) else { return Vec::new() };
     // PlcSed: aCp[n+1] u32s + aSed[n] (Sed = fn 2, fcSepx 4, fnMpr 2, fcMpr 4).
@@ -48,21 +73,36 @@ pub(crate) fn parse(word: &[u8], table: &[u8], fib: &Fib) -> Vec<Section> {
         let sed_at = (n + 1) * 4 + i * 12;
         let fc_sepx = plc.get(sed_at + 2..sed_at + 6).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).unwrap_or(0xFFFF_FFFF);
         let mut props = SectionProps::default();
+        let mut grpf_ihdt = 0;
         // Sepx: cb u16, then a grpprl of section sprms.
         let mut explicit_orient = false;
-        if let Some(grpprl) =
-            word.get(fc_sepx as usize..).and_then(|sepx| sepx.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)).and_then(|cb| {
+        let stored = word
+            .get(fc_sepx as usize..)
+            .and_then(|sepx| sepx.get(..2).map(|b| u16::from_le_bytes([b[0], b[1]]) as usize))
+            .and_then(|cb| {
                 let at = (fc_sepx as usize).checked_add(2)?;
                 word.get(at..at.checked_add(cb)?)
             })
+            .unwrap_or_default();
+        let grpprl = sepx(stored, end_cp);
         {
-            for prl in sprm::iter(grpprl) {
+            for prl in sprm::iter(&grpprl) {
+                if prl.op == S_GPRF_IHDT {
+                    grpf_ihdt = prl.operand.first().copied().unwrap_or(0);
+                }
                 // Only a defined operand counts as explicit; anything else leaves the
                 // orientation to the page shape.
                 if prl.op == S_ORIENTATION && matches!(prl.operand.first(), Some(1 | 2)) {
                     explicit_orient = true;
                 }
                 apply_section(&mut props, &prl);
+            }
+        }
+        // sprmSNFtn and sprmSNEdn count only with continuous numbering ([MS-DOC] §2.6.4; Word
+        // allows another start only then), whatever order the sprms come in.
+        for pr in [&mut props.footnote_pr, &mut props.endnote_pr] {
+            if matches!(pr.num_restart, Some(craft_wordmodel::section::NoteRestart::EachSect | craft_wordmodel::section::NoteRestart::EachPage)) {
+                pr.num_start = None;
             }
         }
         // Without an explicit orientation sprm, infer it from the page shape.
@@ -73,7 +113,7 @@ pub(crate) fn parse(word: &[u8], table: &[u8], fib: &Fib) -> Vec<Section> {
                 props.landscape = true;
             }
         }
-        out.push(Section { end_cp, props });
+        out.push(Section { end_cp, props, grpf_ihdt });
     }
     out
 }
@@ -103,7 +143,13 @@ fn apply_section(s: &mut SectionProps, prl: &Prl) {
         S_TITLE_PAGE => s.title_page = prl.operand.first().is_some_and(|&v| v != 0),
         S_CCOLUMNS => {
             if let Some(c) = s16(prl) {
-                s.columns = Columns { count: (c as u32).saturating_add(1).min(44), ..Default::default() };
+                // Only the count: the spacing is its own sprm, which may come first.
+                s.columns.count = (c as u32).saturating_add(1).min(44);
+            }
+        }
+        S_DXA_COLUMNS => {
+            if let Some(v) = s16(prl) {
+                s.columns.space = tw(i32::from(v as u16));
             }
         }
         S_PGN_START => {
@@ -161,6 +207,32 @@ fn apply_section(s: &mut SectionProps, prl: &Prl) {
         S_DXA_GUTTER => {
             if let Some(v) = s16(prl) {
                 s.gutter = tw(v as i32);
+            }
+        }
+        // A section's own value is explicit, whatever the document's: 1 the bottom of the page,
+        // 2 beneath the text.
+        S_FPC => match prl.operand.first() {
+            Some(1) => s.footnote_pr.pos = Some(craft_wordmodel::section::NotePos::PageBottom),
+            Some(2) => s.footnote_pr.pos = Some(craft_wordmodel::section::NotePos::BeneathText),
+            _ => {}
+        },
+        // As explicit: 0 continuous, which the document's restart doesn't override.
+        S_RNC_FTN | S_RNC_EDN => {
+            let pr = if prl.op == S_RNC_FTN { &mut s.footnote_pr } else { &mut s.endnote_pr };
+            if let Some(&v) = prl.operand.first() {
+                pr.num_restart = crate::dop::restart(u16::from(v)).or((v == 0).then_some(craft_wordmodel::section::NoteRestart::Continuous));
+            }
+        }
+        S_N_FTN | S_N_EDN => {
+            if let [a, b, ..] = prl.operand {
+                let pr = if prl.op == S_N_FTN { &mut s.footnote_pr } else { &mut s.endnote_pr };
+                pr.num_start = Some(u32::from(u16::from_le_bytes([*a, *b])).clamp(1, craft_wordmodel::section::MAX_NOTE_START));
+            }
+        }
+        S_NFC_FTN_REF | S_NFC_EDN_REF => {
+            if let [a, b, ..] = prl.operand {
+                let pr = if prl.op == S_NFC_FTN_REF { &mut s.footnote_pr } else { &mut s.endnote_pr };
+                pr.num_fmt = Some(crate::list::num_format(u16::from_le_bytes([*a, *b]).min(0xFF) as u8));
             }
         }
         _ => {}

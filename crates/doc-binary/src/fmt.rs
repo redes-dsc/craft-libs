@@ -12,6 +12,8 @@ use crate::sprm::{self, Prl, Toggle};
 const C_BOLD: u16 = 0x0835;
 const C_ITALIC: u16 = 0x0836;
 const C_STRIKE: u16 = 0x0837;
+const C_OUTLINE: u16 = 0x0838;
+const C_SHADOW: u16 = 0x0839;
 const C_SMALL_CAPS: u16 = 0x083A;
 const C_CAPS: u16 = 0x083B;
 const C_HIDDEN: u16 = 0x083C; // sprmCFVanish
@@ -19,7 +21,10 @@ const C_KUL: u16 = 0x2A3E; // underline style (Kul)
 const C_ICO: u16 = 0x2A42; // palette colour
 const C_CR: u16 = 0x6870; // explicit COLORREF
 const C_HPS: u16 = 0x4A43; // half-points
-const C_HPS_POS: u16 = 0x4845; // super/subscript by half-points
+const C_HPS_POS: u16 = 0x4845; // raised (+) or lowered (−) position in half-points
+const C_ISS: u16 = 0x2A48; // superscript (1) or subscript (2)
+const C_DXA_SPACE: u16 = 0x8840; // character spacing in twips
+const C_HPS_KERN: u16 = 0x484B; // kerning from this size, in half-points
 const C_FTC0: u16 = 0x4A4F; // font index (ASCII)
 const C_FTC1: u16 = 0x4A50; // East Asian font index (sprmCRgFtc1)
 const C_FTC_BI: u16 = 0x4A5E; // complex-script font index (sprmCFtcBi)
@@ -45,6 +50,9 @@ const P_DYA_LINE: u16 = 0x6412;
 const P_KEEP: u16 = 0x2405; // keep lines together
 const P_KEEP_FOLLOW: u16 = 0x2406; // keep with next
 const P_PAGE_BREAK_BEFORE: u16 = 0x2407;
+const P_NO_LINE_NUMBERS: u16 = 0x240C; // sprmPFNoLineNumb
+const P_NO_AUTO_HYPH: u16 = 0x242A; // sprmPFNoAutoHyph
+const P_WIDOW_CONTROL: u16 = 0x2431; // sprmPFWidowControl
 const P_OUTLVL: u16 = 0x2640;
 // Paragraph borders ([MS-DOC] §2.6.2). The 80 forms carry a Brc80 (palette colour), the
 // newer ones a BrcOperand: cb(1) + Brc(8, with a full COLORREF).
@@ -58,6 +66,21 @@ const P_BRC_LEFT: u16 = 0xC64F;
 const P_BRC_BOTTOM: u16 = 0xC650;
 const P_BRC_RIGHT: u16 = 0xC651;
 const P_BRC_BETWEEN: u16 = 0xC652;
+// Frames ([MS-DOC] §2.6.2), each a part of `ParaProps::frame`: the anchors (`PositionCodeOperand`),
+// the position, width, height, wrapping and distances from text; and a drop cap (`DcsOperand`).
+pub(crate) const P_PC: u16 = 0x261B;
+pub(crate) const P_DXA_ABS: u16 = 0x8418;
+pub(crate) const P_DYA_ABS: u16 = 0x8419;
+pub(crate) const P_DXA_WIDTH: u16 = 0x841A;
+pub(crate) const P_WR: u16 = 0x2423;
+pub(crate) const P_WHEIGHT_ABS: u16 = 0x442B;
+pub(crate) const P_DCS: u16 = 0x442C;
+pub(crate) const P_DYA_FROM_TEXT: u16 = 0x842E;
+pub(crate) const P_DXA_FROM_TEXT: u16 = 0x842F;
+// Paragraph shading: a 2-byte Shd80 (palette colours), and a cb(1) + 10-byte Shd (COLORREFs)
+// that Word 2000 and later write after it.
+const P_SHD80: u16 = 0x442D;
+const P_SHD: u16 = 0xC64D;
 
 /// Word's 16-colour `Ico` palette ([MS-DOC] §2.9.135), 0 = automatic.
 const ICO: [Rgb; 17] = [
@@ -159,6 +182,39 @@ fn brc(op: &[u8]) -> Option<Border> {
     Some(Border { style: brc_style(b[5]), width: brc_width(b[5], b[4]), color, space: f32::from(b[6] & 0x1F) })
 }
 
+/// Background colour from a 10-byte `Shd`: cvFore, cvBack (COLORREFs), ipat. Solid patterns
+/// show the foreground; clear (0) and the other patterns show the background (Word writes a
+/// plain cell fill as clear with cvBack); nil (0xFFFF) and automatic colours are no fill.
+pub(crate) fn shd_rgb(b: &[u8]) -> Option<Rgb> {
+    let cv = |b: &[u8]| -> Option<Rgb> {
+        match b {
+            [_, _, _, 0xFF] => None, // fAuto
+            [r, g, bl, _] => Some(Rgb(*r, *g, *bl)),
+            _ => None,
+        }
+    };
+    let ipat = b.get(8..10).map(|x| u16::from_le_bytes([x[0], x[1]]))?;
+    match ipat {
+        0xFFFF => None,
+        1 => cv(b.get(0..4)?),
+        _ => cv(b.get(4..8)?),
+    }
+}
+
+/// Background colour from a 2-byte `Shd80` (icoFore, icoBack, ipat bit-fields). As in
+/// [`shd_rgb`], solid shows the foreground and clear (0) the background, which is how Word
+/// 97 writes a plain fill; ico 0 is automatic (no fill).
+pub(crate) fn shd80_rgb(b: &[u8]) -> Option<Rgb> {
+    let v = u16::from_le_bytes([*b.first()?, *b.get(1)?]);
+    let fore = v & 0x1F;
+    let back = (v >> 5) & 0x1F;
+    let ipat = v >> 10;
+    if fore == 0x1F && back == 0x1F {
+        return None;
+    }
+    ico(if ipat == 1 { fore as u8 } else { back as u8 })
+}
+
 /// Put a decoded border on the side its sprm names (`between` = the border between this
 /// paragraph and the next).
 fn set_border(p: &mut ParaProps, op: u16, b: Border) {
@@ -182,6 +238,13 @@ fn u16_of(p: &Prl) -> Option<u16> {
 
 fn s16_of(p: &Prl) -> Option<i16> {
     u16_of(p).map(|v| v as i16)
+}
+
+/// Set `prop` from a Bool8 operand: 0 off, anything else on. A missing operand changes nothing.
+fn set_flag(prop: &mut Option<bool>, p: &Prl) {
+    if let Some(&b) = p.operand.first() {
+        *prop = Some(b != 0);
+    }
 }
 
 fn set(props: &mut Option<bool>, t: Toggle, base: bool) {
@@ -243,15 +306,33 @@ pub(crate) fn apply_char(p: &mut CharProps, prl: &Prl, base: &CharProps, fonts: 
                 p.size = Some((hps as f32 / 2.0).clamp(1.0, 1638.0));
             }
         }
+        // A raised or lowered position, not superscript: Word writes superscript and subscript as
+        // sprmCIss, and reads this one as `w:position` (Word 2016's reading of its own files).
         C_HPS_POS => {
             if let Some(pos) = s16_of(prl) {
-                p.vert_align = Some(match pos {
-                    pos if pos > 0 => VertAlign::Superscript,
-                    pos if pos < 0 => VertAlign::Subscript,
-                    _ => VertAlign::Baseline,
-                });
+                p.position = Some((f32::from(pos) / 2.0).clamp(-1584.0, 1584.0));
             }
         }
+        C_ISS => {
+            p.vert_align = match prl.operand.first().copied() {
+                Some(0) => Some(VertAlign::Baseline),
+                Some(1) => Some(VertAlign::Superscript),
+                Some(2) => Some(VertAlign::Subscript),
+                _ => p.vert_align,
+            };
+        }
+        C_DXA_SPACE => {
+            if let Some(v) = s16_of(prl) {
+                p.spacing = Some((f32::from(v) / 20.0).clamp(-1584.0, 1584.0));
+            }
+        }
+        C_HPS_KERN => {
+            if let Some(v) = u16_of(prl) {
+                p.kern = Some((f32::from(v) / 2.0).min(1638.0));
+            }
+        }
+        C_OUTLINE => set(&mut p.outline, sprm::toggle(prl), base.outline.unwrap_or(false)),
+        C_SHADOW => set(&mut p.shadow, sprm::toggle(prl), base.shadow.unwrap_or(false)),
         C_FTC0 => {
             if let Some(name) = u16_of(prl).and_then(|i| fonts.get(i as usize)) {
                 p.font = Some(name.clone());
@@ -272,9 +353,89 @@ pub(crate) fn apply_char(p: &mut CharProps, prl: &Prl, base: &CharProps, fonts: 
                 p.highlight = Some(*h);
             }
         }
-        C_ISTD => {} // resolved separately through the style table
+        // The run's character style: taken by `char_style_istd` before the run's sprms are applied,
+        // since its formatting is part of their base.
+        C_ISTD => {}
         _ => {}
     }
+}
+
+/// The character style a CHPX grpprl names (`sprmCIstd`), if any: the last one.
+/// The character sprms whose values survive `sprmCIstd` ([MS-DOC] §2.6.1: "During steps 1 and 3,
+/// preserve the previous values of the following"): revision marks and their authors, dates and
+/// save IDs, right-to-left and complex-script text, hidden field and web text, special
+/// characters, pictures and OLE objects, symbols, the font hint, highlighting, font fix-up and
+/// equation justification.
+pub(crate) fn kept_by_istd(op: u16) -> bool {
+    matches!(
+        op,
+        0x0800 // sprmCFRMarkDel
+            | 0x0801 // sprmCFRMarkIns
+            | 0x0802 // sprmCFFldVanish
+            | 0x6A03 // sprmCPicLocation
+            | 0x4804 // sprmCIbstRMark
+            | 0x6805 // sprmCDttmRMark
+            | 0x0806 // sprmCFData
+            | 0x4807 // sprmCIdslRMark
+            | 0x6A09 // sprmCSymbol
+            | 0x080A // sprmCFOle2
+            | 0x2A0C // sprmCHighlight
+            | 0x0811 // sprmCFWebHidden
+            | 0x6815 // sprmCRsidProp
+            | 0x6816 // sprmCRsidText
+            | 0x6817 // sprmCRsidRMDel
+            | 0xC81A // sprmCFMathPr
+            | 0x0855 // sprmCFSpec
+            | 0x0856 // sprmCFObj
+            | 0x085A // sprmCFBiDi
+            | 0x0882 // sprmCFComplexScripts
+            | 0x4863 // sprmCIbstRMarkDel
+            | 0x6864 // sprmCDttmRMarkDel
+            | 0x286F // sprmCIdctHint
+            | 0xCA57 // sprmCPropRMark90
+            | 0xCA89 // sprmCPropRMark
+            | 0x2A83 // sprmCWall
+            | 0x2A86 // sprmCNeedFontFixup
+            | 0x2A90 // sprmCFSdtVanish
+    )
+}
+
+/// The character sprms of `grpprl` that count, in order: `sprmCIstd` first resets the run to its
+/// paragraph style, so a sprm before the last one counts only if [`kept_by_istd`].
+pub(crate) fn after_istd<'g>(grpprl: &'g [u8]) -> impl Iterator<Item = Prl<'g>> {
+    let last = sprm::iter(grpprl).enumerate().filter(|(_, p)| p.op == C_ISTD).map(|(i, _)| i).last();
+    sprm::iter(grpprl).enumerate().filter(move |(i, p)| p.sgc() == 2 && last.is_none_or(|l| *i >= l || kept_by_istd(p.op))).map(|(_, p)| p)
+}
+
+pub(crate) fn char_style_istd(grpprl: &[u8]) -> Option<u16> {
+    sprm::iter(grpprl).filter(|p| p.op == C_ISTD).filter_map(|p| u16_of(&p)).last()
+}
+
+/// The formatting a run in character style `chr` has before its own sprms, in a paragraph whose
+/// style gives `para`: the character style's properties over the paragraph style's, except that a
+/// toggle property the character style turns on inverts the paragraph style's value (a bold
+/// character style in a bold paragraph is not bold). That combined value is also what a run's
+/// `0x81` toggle operand inverts. As Word shows files Word 95 and Word 2016 wrote, for bold,
+/// italic, caps and strikethrough; the other toggle sprms are read the same way.
+pub(crate) fn with_char_style(para: &CharProps, chr: &CharProps) -> CharProps {
+    let mut out = para.clone();
+    out.overlay(chr);
+    let toggles = [
+        (&mut out.bold, para.bold, chr.bold),
+        (&mut out.italic, para.italic, chr.italic),
+        (&mut out.strike, para.strike, chr.strike),
+        (&mut out.outline, para.outline, chr.outline),
+        (&mut out.shadow, para.shadow, chr.shadow),
+        (&mut out.small_caps, para.small_caps, chr.small_caps),
+        (&mut out.caps, para.caps, chr.caps),
+        (&mut out.hidden, para.hidden, chr.hidden),
+    ];
+    for (slot, p, c) in toggles {
+        if let Some(c) = c {
+            *slot = Some(p.unwrap_or(false) ^ c);
+        }
+    }
+    out
 }
 
 /// Custom tab stops from `sprmPChgTabsPapx` / `sprmPChgTabs` ([MS-DOC] PChgTabsPapxOperand,
@@ -394,21 +555,14 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 });
             }
         }
-        P_KEEP => {
-            if matches!(sprm::toggle(prl), Toggle::On) {
-                p.keep_lines = Some(true);
-            }
-        }
-        P_KEEP_FOLLOW => {
-            if matches!(sprm::toggle(prl), Toggle::On) {
-                p.keep_next = Some(true);
-            }
-        }
-        P_PAGE_BREAK_BEFORE => {
-            if matches!(sprm::toggle(prl), Toggle::On) {
-                p.page_break_before = Some(true);
-            }
-        }
+        // Bool8 operands: 0 turns off what a style turns on (Word writes `2405 00` for a paragraph
+        // of a keep-together style that isn't, and reads it as `w:keepLines w:val="0"`).
+        P_KEEP => set_flag(&mut p.keep_lines, prl),
+        P_KEEP_FOLLOW => set_flag(&mut p.keep_next, prl),
+        P_PAGE_BREAK_BEFORE => set_flag(&mut p.page_break_before, prl),
+        P_WIDOW_CONTROL => set_flag(&mut p.widow_control, prl),
+        P_NO_LINE_NUMBERS => set_flag(&mut p.suppress_line_numbers, prl),
+        P_NO_AUTO_HYPH => set_flag(&mut p.suppress_hyphens, prl),
         P_OUTLVL => {
             if let Some(&l) = prl.operand.first() {
                 p.outline_level = Some(l.min(8));
@@ -424,6 +578,101 @@ pub(crate) fn apply_para(p: &mut ParaProps, prl: &Prl) {
                 set_border(p, prl.op, b);
             }
         }
+        // As the DOCX reader reads `w:shd`: the fill colour, or a solid pattern's; a clear or
+        // automatic one is none. A truncated operand is ignored.
+        P_SHD80 if prl.operand.len() >= 2 => p.shading = shd80_rgb(prl.operand),
+        P_SHD if prl.operand.len() >= 11 => p.shading = prl.operand.get(1..).and_then(shd_rgb),
+        P_DCS => {
+            // Bits 0-2: 1 dropped, 2 in the margin (0 none); bits 3-7: the lines it drops. Each is
+            // explicit, as it can turn off or change its style's drop cap.
+            let v = u16_of(prl).unwrap_or(0);
+            match v & 0x07 {
+                kind @ (1 | 2) => {
+                    p.drop_cap = Some(((v >> 3) & 0x1F).clamp(1, 10) as u8);
+                    p.drop_cap_margin = Some(kind == 2);
+                    p.drop_cap_distance = p.frame.as_ref().map(|f| f.h_space).filter(|d| *d > 0.0);
+                }
+                _ => (p.drop_cap, p.drop_cap_margin) = (Some(0), None),
+            }
+        }
+        op if is_frame(op) => apply_frame(p, prl),
+        _ => {}
+    }
+}
+
+/// Whether `op` is one of the frame sprms [`apply_frame`] reads.
+pub(crate) fn is_frame(op: u16) -> bool {
+    matches!(op, P_PC | P_DXA_ABS | P_DYA_ABS | P_DXA_WIDTH | P_WR | P_WHEIGHT_ABS | P_DYA_FROM_TEXT | P_DXA_FROM_TEXT)
+}
+
+/// A frame sprm, applied to the paragraph's frame (made, at a column's left edge and the margin's
+/// top, wrapping `auto`, when it has none). As Word 2016 reads Word 97 and Word 6.0/95 files into
+/// `w:framePr`: the special positions become alignments, and the others are twips as stored
+/// (Word stores a frame at 0 as at 1). A width or height of 0 fits the text; a height with bit 15
+/// set is a minimum.
+fn apply_frame(p: &mut ParaProps, prl: &Prl) {
+    let tw = |v: i32| (v as f32 / 20.0).clamp(-1584.0, 1584.0);
+    let Some(v) = u16_of(prl).or_else(|| prl.operand.first().map(|&b| u16::from(b))) else { return };
+    let f = p.frame.get_or_insert_with(|| craft_wordmodel::props::TextFrame {
+        h_anchor: "text".into(),
+        v_anchor: "margin".into(),
+        wrap: "auto".into(),
+        ..Default::default()
+    });
+    let anchor = |code: u16, names: [&str; 3]| names.get(usize::from(code)).map(|s| (*s).to_owned());
+    match prl.op {
+        P_PC => {
+            // Bits 4-5 vertical: margin, page, paragraph; bits 6-7 horizontal: column, margin,
+            // page. 3, which no file had, leaves the anchor as it was.
+            if let Some(a) = anchor((v >> 4) & 3, ["margin", "page", "text"]) {
+                f.v_anchor = a;
+            }
+            if let Some(a) = anchor((v >> 6) & 3, ["text", "margin", "page"]) {
+                f.h_anchor = a;
+            }
+        }
+        P_DXA_ABS => {
+            let (x, align) = match v as i16 {
+                -4 => (0, Some("center")),
+                -8 => (0, Some("right")),
+                -12 => (0, Some("inside")),
+                -16 => (0, Some("outside")),
+                x => (i32::from(x), None),
+            };
+            (f.x, f.x_align) = (tw(x), align.map(str::to_owned));
+        }
+        P_DYA_ABS => {
+            let (y, align) = match v as i16 {
+                -4 => (0, Some("top")),
+                -8 => (0, Some("center")),
+                -12 => (0, Some("bottom")),
+                -16 => (0, Some("inside")),
+                // Word 2016 reads -20 as y="-20", not as "outside".
+                y => (i32::from(y), None),
+            };
+            (f.y, f.y_align) = (tw(y), align.map(str::to_owned));
+        }
+        P_DXA_WIDTH => f.w = (v != 0).then(|| tw(i32::from(v)).max(0.0)),
+        P_WHEIGHT_ABS => {
+            let h = v & 0x7FFF;
+            f.h = (h != 0).then(|| tw(i32::from(h)));
+            f.h_exact = h != 0 && v & 0x8000 == 0;
+        }
+        P_WR => {
+            f.wrap = match v {
+                1 => "notBeside",
+                2 => "around",
+                _ => "auto",
+            }
+            .into();
+        }
+        P_DXA_FROM_TEXT => {
+            f.h_space = tw(i32::from(v)).max(0.0);
+            if p.drop_cap.is_some() {
+                p.drop_cap_distance = Some(f.h_space).filter(|d| *d > 0.0);
+            }
+        }
+        P_DYA_FROM_TEXT => f.v_space = tw(i32::from(v)).max(0.0),
         _ => {}
     }
 }
