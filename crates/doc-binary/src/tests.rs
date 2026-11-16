@@ -1271,6 +1271,114 @@ fn table_assembled_from_marks() {
     assert_eq!(last.text, "tail");
 }
 
+/// Paragraph shading as Word 2016 writes it and the DOCX reader reads `w:shd`: `sprmPShd80` (a
+/// solid yellow, ico 7 on ipat 1), then the `sprmPShd` Word writes after it, which wins (a clear
+/// fill of 0x112233); a 25% pattern in automatic colours has no fill.
+#[test]
+fn paragraph_shading_is_read() {
+    let shd = |fore: [u8; 4], back: [u8; 4], ipat: u16| -> Vec<u8> { [&[10u8][..], &fore, &back, &ipat.to_le_bytes()].concat() };
+    let spec = RichSpec {
+        text: "a\rb\rc\r",
+        styles: vec![(1, 0x0FFF, "Normal", Vec::new(), Vec::new())],
+        fonts: vec!["Times New Roman"],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![
+            (0, 0, grpprl(&[(0x442D, &0x0407u16.to_le_bytes())])),
+            (2, 0, grpprl(&[(0x442D, &0x0407u16.to_le_bytes()), (0xC64D, &shd([0, 0, 0, 0xFF], [0x11, 0x22, 0x33, 0], 0))])),
+            (4, 0, grpprl(&[(0x442D, &0x1400u16.to_le_bytes())])),
+        ],
+    };
+    let doc = read(&rich_doc(&spec)).expect("opens");
+    let shading: Vec<_> = doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.props.shading).collect();
+    assert_eq!(shading, [Some(craft_wordmodel::Rgb(255, 255, 0)), Some(craft_wordmodel::Rgb(0x11, 0x22, 0x33)), None]);
+}
+
+/// Cell borders from the TC80s of `sprmTDefTable`, as Word 2016 reads them: a zero side is
+/// unset (the table's border shows), an all-ones side is no border (`w:val="nil"`, hiding the
+/// table's), and any other side is that border.
+#[test]
+fn cell_borders_are_read_from_the_tc80s() {
+    use craft_wordmodel::props::{Border, BorderStyle};
+    let tc = |top: [u8; 4], left: [u8; 4], bottom: [u8; 4], right: [u8; 4]| -> Vec<u8> { [&[0u8; 4][..], &top, &left, &bottom, &right].concat() };
+    let (unset, nil) = ([0u8; 4], [0xFFu8; 4]);
+    let mut body = vec![3u8];
+    for e in [0i16, 1440, 2880, 4320] {
+        body.extend_from_slice(&e.to_le_bytes());
+    }
+    body.extend(tc(unset, unset, unset, unset));
+    body.extend(tc([6, 3, 6, 0], nil, unset, unset)); // top: double, 3/4 pt, red
+    body.extend(tc(unset, unset, [24, 1, 11, 2], unset)); // bottom: single, 3 pt, dark green, 2 pt off
+    let mut def = 0xD608u16.to_le_bytes().to_vec();
+    def.extend_from_slice(&((body.len() + 1) as u16).to_le_bytes());
+    def.extend(body);
+    let text = "a\u{7}b\u{7}c\u{7}\r";
+    let in_tbl = grpprl(&[(0x2416, &[0x01])]);
+    let ttp: Vec<u8> = [grpprl(&[(0x2416, &[0x01]), (0x2417, &[0x01])]), def].concat();
+    let spec = StructSpec {
+        text,
+        header_stories: vec![],
+        sections: vec![(text.chars().count() as u32, Vec::new())],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![(0, 0, in_tbl.clone()), (2, 0, in_tbl), (4, 0, ttp), (6, 0, Vec::new())],
+        plf_lst: Vec::new(),
+        plf_lfo: Vec::new(),
+        note_stories: vec![],
+        endnote_stories: vec![],
+        extra_pairs: Vec::new(),
+        data_stream: Vec::new(),
+    };
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let tbl = doc.body.iter().find_map(|b| b.as_table()).expect("table");
+    let cells: Vec<_> = tbl.rows[0].cells.iter().map(|c| c.props.borders).collect();
+    assert_eq!(cells[0], None);
+    let b = cells[1].expect("cell 2's borders");
+    assert_eq!(b.top, Some(Border { style: BorderStyle::Double, width: 0.75, color: Some(craft_wordmodel::Rgb(255, 0, 0)), space: 0.0 }));
+    assert_eq!(b.left.map(|l| l.style), Some(BorderStyle::None), "nil hides the table's border");
+    assert_eq!((b.bottom, b.right), (None, None));
+    let b = cells[2].expect("cell 3's borders");
+    assert_eq!(b.bottom, Some(Border { style: BorderStyle::Single, width: 3.0, color: Some(craft_wordmodel::Rgb(0, 128, 0)), space: 2.0 }));
+    assert_eq!((b.top, b.left, b.right), (None, None, None));
+}
+
+/// Two cells merged across (sprmTMerge), the right border only on the second, as
+/// Word 2016 writes `\clmgf`/`\clmrg` with a right border on the second cell: Word keeps the cells
+/// and draws that border on the merged area's right edge, so the one merged cell has it.
+#[test]
+fn a_merged_cell_keeps_its_last_cells_right_border() {
+    use craft_wordmodel::props::BorderStyle;
+    let tc = |rgf: u16, right: [u8; 4]| -> Vec<u8> { [&rgf.to_le_bytes()[..], &[0, 0], &[0; 12], &right].concat() };
+    let mut body = vec![2u8];
+    for e in [0i16, 1440, 2880] {
+        body.extend_from_slice(&e.to_le_bytes());
+    }
+    body.extend(tc(0, [0; 4]));
+    body.extend(tc(0, [24, 1, 0, 0]));
+    let mut def = 0xD608u16.to_le_bytes().to_vec();
+    def.extend_from_slice(&((body.len() + 1) as u16).to_le_bytes());
+    def.extend(body);
+    let text = "a\u{7}\u{7}\u{7}\r";
+    let in_tbl = grpprl(&[(0x2416, &[0x01])]);
+    let ttp: Vec<u8> = [grpprl(&[(0x2416, &[0x01]), (0x2417, &[0x01]), (0x5624, &[0, 2])]), def].concat();
+    let spec = StructSpec {
+        text,
+        header_stories: vec![],
+        sections: vec![(text.chars().count() as u32, Vec::new())],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![(0, 0, in_tbl.clone()), (2, 0, in_tbl), (3, 0, ttp), (4, 0, Vec::new())],
+        plf_lst: Vec::new(),
+        plf_lfo: Vec::new(),
+        note_stories: vec![],
+        endnote_stories: vec![],
+        extra_pairs: Vec::new(),
+        data_stream: Vec::new(),
+    };
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let tbl = doc.body.iter().find_map(|b| b.as_table()).expect("table");
+    let cell = tbl.rows[0].cells.first().expect("a cell");
+    assert_eq!(cell.props.span, 2);
+    assert_eq!(cell.props.borders.and_then(|b| b.right).map(|r| r.style), Some(BorderStyle::Single));
+}
+
 #[test]
 fn table_merges_borders_shading() {
     // Two rows: the first "a\x07 b\x07 c\x07" with cells 0-1 horizontally merged; the second
@@ -1601,6 +1709,127 @@ fn footnote_reference_links_story_part() {
     let part = doc.parts.get(id).expect("note part");
     assert!(part.blocks.iter().any(|b| b.as_para().is_some_and(|p| p.text.contains("Note body"))), "note text: {:?}", part.blocks);
     assert_eq!(part.kind, craft_wordmodel::PartKind::Footnote);
+}
+
+#[test]
+fn a_custom_note_mark_is_the_references_run() {
+    // As Word 2016 writes a footnote marked "ab": FRD 0, and the mark's characters stand at the
+    // reference CP in their own run (Word reads <w:footnoteReference w:customMarkFollows="1"/>
+    // <w:t>ab</w:t>, then " here" as text). The note's own text keeps the mark as text.
+    let text = "See ab here\r";
+    let ccp = text.chars().count() as u32;
+    let sup = grpprl(&[(0x2A48, &[1])]);
+    let spec = StructSpec {
+        text,
+        chpx_runs: vec![(0, Vec::new()), (4, sup), (6, Vec::new())],
+        note_stories: vec!["ab Note\r"],
+        extra_pairs: vec![(2, plc(&[4, ccp], &0u16.to_le_bytes())), (3, plc(&[0, 8], &[]))],
+        ..structured_spec(text, ccp)
+    };
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let p0 = para0(&doc);
+    assert_eq!(p0.text, "See \u{FFFC} here");
+    let craft_wordmodel::para::InlineObject::NoteRef { kind, id, custom } = p0.objects.first().expect("a note reference") else {
+        panic!("not a note")
+    };
+    assert_eq!((*kind, custom.as_str()), (craft_wordmodel::para::NoteKind::Footnote, "ab"));
+    let part = doc.parts.get(id).expect("note part");
+    assert_eq!(part.blocks.first().and_then(|b| b.as_para()).map(|p| p.text.as_str()), Some("ab Note"));
+}
+
+#[test]
+fn a_custom_note_mark_can_be_a_symbol() {
+    // Insert > Symbol as a mark: the placeholder U+0028 with sprmCSymbol (font 0, U+F071), as
+    // the body text stores a symbol. The mark is the symbol's character, not "(".
+    let text = "See ( here\r";
+    let ccp = text.chars().count() as u32;
+    let symbol = grpprl(&[(0x6A09, &[0, 0, 0x71, 0xF0])]);
+    let spec = StructSpec {
+        text,
+        chpx_runs: vec![(0, Vec::new()), (4, symbol), (5, Vec::new())],
+        note_stories: vec!["( Note\r"],
+        extra_pairs: vec![(2, plc(&[4, ccp], &0u16.to_le_bytes())), (3, plc(&[0, 7], &[]))],
+        ..structured_spec(text, ccp)
+    };
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let p0 = para0(&doc);
+    let craft_wordmodel::para::InlineObject::NoteRef { custom, .. } = p0.objects.first().expect("a note reference") else { panic!("not a note") };
+    assert_eq!(custom, "\u{F071}");
+}
+
+#[test]
+fn note_separators_come_from_the_first_header_stories() {
+    // [MS-DOC] Plcfhdd: stories 0-2 are the footnotes' separator, continuation separator and
+    // continuation notice, 3-5 the endnotes'. Word writes its default separator as a story holding
+    // 0x03 (0x04 for the continuation one); `.docx` has <w:separator/> there.
+    let text = "Body\r";
+    let ccp = text.chars().count() as u32;
+    let mut spec = StructSpec { header_stories: vec!["\u{3}\r\r", "NOTICE\r\r"], ..structured_spec(text, ccp) };
+    // Slot 0 [0, 3), slot 1 empty, slot 2 [3, 11), the endnotes' empty.
+    spec.extra_pairs.push((11, plc(&[0, 3, 3, 11, 11, 11, 11], &[])));
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let seps = &doc.footnote_separators;
+    let line = seps.separator.as_ref().and_then(|b| b.first()).and_then(|b| b.as_para()).expect("the separator's paragraph");
+    assert_eq!(line.objects.first().and_then(|o| o.as_note_separator()), Some(false));
+    assert!(seps.continuation_separator.is_none());
+    let notice = seps.continuation_notice.as_ref().and_then(|b| b.first()).and_then(|b| b.as_para()).map(|p| p.text.as_str());
+    assert_eq!(notice, Some("NOTICE"));
+    assert!(doc.endnote_separators.is_empty());
+}
+
+#[test]
+fn note_options_and_facing_pages_come_from_the_dop_and_the_section() {
+    // As Word 2016 writes "footnotes beneath the text, i ii iii, restarting each page; endnotes at
+    // the end of each section, A B C from B; different odd and even pages": the Dop's byte 0 0x43
+    // (facing pages, fpc 2), rncFtn 2 at 2, nEdn 2 at 0x34, epc 0 at 0x36, Dop97 nfcFtnRef 2 and
+    // nfcEdnRef 3 at 0x1EC; and the section's sprmSFpc, sprmSRncFtn, sprmSNfcFtnRef, sprmSNEdn and
+    // sprmSNfcEdnRef. Word reads both as the settings' and the section's footnotePr/endnotePr.
+    use craft_wordmodel::section::{NotePos, NoteRestart, NumFormat};
+    let mut dop = vec![0u8; 0x1F0];
+    dop[0] = 0x43;
+    dop[2..4].copy_from_slice(&0x0006u16.to_le_bytes());
+    dop[0x34..0x36].copy_from_slice(&0x0008u16.to_le_bytes());
+    dop[0x36..0x38].copy_from_slice(&0x9000u16.to_le_bytes());
+    dop[0x1EC..0x1EE].copy_from_slice(&2u16.to_le_bytes());
+    dop[0x1EE..0x1F0].copy_from_slice(&3u16.to_le_bytes());
+    let two = 2u16.to_le_bytes();
+    let three = 3u16.to_le_bytes();
+    let sepx = grpprl(&[(0x303B, &[2]), (0x303C, &[2]), (0x5040, &two), (0x5041, &two), (0x5042, &three)]);
+    let mut spec = one_section("Text\r", sepx, vec![(0, 0, Vec::new())]);
+    spec.extra_pairs.push((31, dop));
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let st = &doc.settings;
+    assert!(st.even_odd_headers);
+    assert_eq!(
+        (st.footnote_pr.pos, st.footnote_pr.num_restart, st.footnote_format),
+        (Some(NotePos::BeneathText), Some(NoteRestart::EachPage), NumFormat::LowerRoman)
+    );
+    assert_eq!((st.endnote_pr.pos, st.endnote_pr.num_start, st.endnote_format), (Some(NotePos::SectEnd), Some(2), NumFormat::UpperLetter));
+    let s = &doc.last_section;
+    assert_eq!(
+        (s.footnote_pr.pos, s.footnote_pr.num_restart, s.footnote_pr.num_fmt),
+        (Some(NotePos::BeneathText), Some(NoteRestart::EachPage), Some(NumFormat::LowerRoman))
+    );
+    assert_eq!((s.endnote_pr.num_start, s.endnote_pr.num_fmt), (Some(2), Some(NumFormat::UpperLetter)));
+}
+
+#[test]
+fn a_document_without_note_options_keeps_words_defaults() {
+    // Word 2016's untouched document: Dop byte 0 0x22 (fpc 1), nFtn 1, epc 3, nfcEdnRef 2.
+    use craft_wordmodel::section::NumFormat;
+    let mut dop = vec![0u8; 0x1F0];
+    dop[0] = 0x22;
+    dop[2..4].copy_from_slice(&0x0004u16.to_le_bytes());
+    dop[0x34..0x36].copy_from_slice(&0x0004u16.to_le_bytes());
+    dop[0x36..0x38].copy_from_slice(&0x9003u16.to_le_bytes());
+    dop[0x1EE..0x1F0].copy_from_slice(&2u16.to_le_bytes());
+    let mut spec = one_section("Text\r", Vec::new(), vec![(0, 0, Vec::new())]);
+    spec.extra_pairs.push((31, dop));
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let st = &doc.settings;
+    assert!(!st.even_odd_headers);
+    assert!(st.footnote_pr.is_empty() && st.endnote_pr.is_empty());
+    assert_eq!((st.footnote_format, st.endnote_format), (NumFormat::Decimal, NumFormat::LowerRoman));
 }
 
 #[test]
@@ -2129,6 +2358,156 @@ fn piece_prm_paragraph_formatting_applies_to_the_marks_paragraph() {
     assert_eq!(para(0x0000), (Some(18.0), None), "no Prm: the PAPX's indent");
     assert_eq!(para(0x0001), (Some(72.0), Some(craft_wordmodel::props::Align::Center)), "Prm1: the Prc's sprms override the PAPX's");
     assert_eq!(para(0x020A), (Some(18.0), Some(craft_wordmodel::props::Align::Right)), "Prm0: sprmPJc right");
+}
+
+#[test]
+fn piece_prm0_widow_control_is_sprm_p_f_widow_control() {
+    // Prm0 isprm 0x33 is sprmPFWidowControl (0x2431, [MS-DOC] §2.9.215), operand 0: off.
+    let spec = RichSpec {
+        text: "Text\r",
+        styles: vec![(1, 0x0FFF, "Normal", Vec::new(), Vec::new())],
+        fonts: vec!["Times New Roman"],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![(4, 0, Vec::new())],
+    };
+    let doc = read(&rich_doc_with(&spec, &RichExtra { prm: 0x33 << 1, ..Default::default() })).expect("opens");
+    assert_eq!(para0(&doc).props.widow_control, Some(false));
+}
+
+/// What Word 2016 writes for these paragraph properties, and reads back as `.docx`: widow control
+/// off (`2431 00`) and on, no line numbers (`240C 01`), no hyphenation (`242A 01`), and a
+/// paragraph of a keep-together, keep-with-next style that turns them off (`2405 00`, `2406 00`).
+#[test]
+fn paragraph_flags_and_their_off_values_are_read() {
+    let spec = RichSpec {
+        text: "a\rb\rc\rd\r",
+        styles: vec![
+            (1, 0x0FFF, "Normal", Vec::new(), Vec::new()),
+            (1, 0, "Kept", grpprl(&[(0x2405, &[0x01]), (0x2406, &[0x01]), (0x2407, &[0x01])]), Vec::new()),
+        ],
+        fonts: vec!["Times New Roman"],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![
+            (0, 0, grpprl(&[(0x2431, &[0x00]), (0x240C, &[0x01]), (0x242A, &[0x01])])),
+            (2, 0, grpprl(&[(0x2431, &[0x01])])),
+            (4, 1, grpprl(&[(0x2405, &[0x00]), (0x2406, &[0x00]), (0x2407, &[0x00])])),
+            (6, 1, Vec::new()),
+        ],
+    };
+    let doc = read(&rich_doc(&spec)).expect("opens");
+    let ps: Vec<_> = doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.props.clone()).collect();
+    assert_eq!((ps[0].widow_control, ps[0].suppress_line_numbers, ps[0].suppress_hyphens), (Some(false), Some(true), Some(true)));
+    assert_eq!(ps[1].widow_control, Some(true));
+    assert_eq!((ps[2].keep_lines, ps[2].keep_next, ps[2].page_break_before), (Some(false), Some(false), Some(false)));
+    // The style's own, unchanged by a paragraph that doesn't override them.
+    assert_eq!(ps[3].keep_lines, None);
+    let kept = doc.styles.styles.iter().find(|s| s.name == "Kept").expect("style");
+    assert_eq!((kept.para.keep_lines, kept.para.keep_next, kept.para.page_break_before), (Some(true), Some(true), Some(true)));
+}
+
+/// What Word 2016 writes for these character properties (and reads back as `.docx`):
+/// superscript and subscript are `sprmCIss` (`2A48 01`, `02`); `sprmCHpsPos` is a raised or
+/// lowered position (`w:position` 6 and -4 half-points), not superscript; spacing in twips
+/// (`w:spacing` 20, -10); kerning from 12 pt (`w:kern` 24 half-points); outline and shadow.
+#[test]
+fn character_position_spacing_kerning_and_effects_are_read() {
+    let spec = RichSpec {
+        text: "abcdefghi\r",
+        styles: vec![(1, 0x0FFF, "Normal", Vec::new(), Vec::new())],
+        fonts: vec!["Times New Roman"],
+        chpx_runs: vec![
+            (0, grpprl(&[(0x2A48, &[0x01])])),
+            (1, grpprl(&[(0x2A48, &[0x02])])),
+            (2, grpprl(&[(0x4845, &6i16.to_le_bytes())])),
+            (3, grpprl(&[(0x4845, &(-4i16).to_le_bytes())])),
+            (4, grpprl(&[(0x8840, &20i16.to_le_bytes())])),
+            (5, grpprl(&[(0x8840, &(-10i16).to_le_bytes())])),
+            (6, grpprl(&[(0x484B, &24u16.to_le_bytes())])),
+            (7, grpprl(&[(0x0838, &[0x81])])),
+            (8, grpprl(&[(0x0839, &[0x81])])),
+            (9, Vec::new()),
+        ],
+        papx_entries: vec![(0, 0, Vec::new())],
+    };
+    use craft_wordmodel::props::VertAlign;
+    let doc = read(&rich_doc(&spec)).expect("opens");
+    let p = para0(&doc);
+    let r: Vec<_> = p.runs.iter().map(|r| r.props.clone()).collect();
+    assert_eq!((r[0].vert_align, r[1].vert_align), (Some(VertAlign::Superscript), Some(VertAlign::Subscript)));
+    assert_eq!((r[2].position, r[2].vert_align, r[3].position, r[3].vert_align), (Some(3.0), None, Some(-2.0), None));
+    assert_eq!((r[4].spacing, r[5].spacing), (Some(1.0), Some(-0.5)));
+    assert_eq!(r[6].kern, Some(12.0));
+    assert_eq!((r[7].outline, r[8].shadow), (Some(true), Some(true)));
+}
+
+/// Character styles as Word 2016 writes them (`sprmCIstd`) and shows them: the run takes the style
+/// (`w:rStyle`) and its formatting; a run's `0x81` inverts the paragraph style's value combined
+/// with the character style's, where a bold character style in a bold paragraph is not bold; and
+/// a character style's font beats its paragraph style's.
+#[test]
+fn character_styles_apply_to_their_runs() {
+    let spec = RichSpec {
+        text: "abcde\rfgh\r",
+        styles: vec![
+            (1, 0x0FFF, "Normal", Vec::new(), Vec::new()),
+            (1, 0, "BoldPara", Vec::new(), grpprl(&[(0x0835, &[0x81]), (0x4A4F, &1u16.to_le_bytes())])),
+            (2, 0x0FFF, "MyStrong", Vec::new(), grpprl(&[(0x0835, &[0x81]), (0x2A42, &[0x06])])),
+            (2, 0x0FFF, "TimesStyle", Vec::new(), grpprl(&[(0x4A4F, &0u16.to_le_bytes())])),
+        ],
+        fonts: vec!["Times New Roman", "Arial"],
+        chpx_runs: vec![
+            (0, Vec::new()),
+            (1, grpprl(&[(0x4A30, &2u16.to_le_bytes())])),
+            (2, grpprl(&[(0x4A30, &2u16.to_le_bytes()), (0x0835, &[0x81])])),
+            (3, Vec::new()),
+            (6, grpprl(&[(0x4A30, &2u16.to_le_bytes())])),
+            (7, grpprl(&[(0x4A30, &2u16.to_le_bytes()), (0x0835, &[0x81])])),
+            (8, grpprl(&[(0x4A30, &3u16.to_le_bytes())])),
+            (9, Vec::new()),
+        ],
+        papx_entries: vec![(0, 0, Vec::new()), (6, 1, Vec::new())],
+    };
+    let doc = read(&rich_doc(&spec)).expect("opens");
+    let ps: Vec<_> = doc.body.iter().filter_map(|b| b.as_para()).collect();
+    let runs = |i: usize| -> Vec<(Option<String>, bool, String)> {
+        let p = ps[i];
+        p.runs
+            .iter()
+            .map(|r| {
+                let c = doc.styles.resolve_char(p.props.style.as_deref(), &r.props);
+                (r.props.style.clone(), c.bold, c.font)
+            })
+            .collect()
+    };
+    let strong = || Some("MyStrong".to_owned());
+    let (times, arial) = ("Times New Roman".to_owned(), "Arial".to_owned());
+    // In Normal: plain, MyStrong (bold), MyStrong with 0x81 (not bold), plain.
+    assert_eq!(
+        runs(0),
+        [(None, false, times.clone()), (strong(), true, times.clone()), (strong(), false, times.clone()), (None, false, times.clone())]
+    );
+    assert!(ps[0].runs[1].props.color.is_none(), "the style's colour stays the style's");
+    // In BoldPara (bold, Arial): MyStrong cancels the bold, 0x81 brings it back, and TimesStyle's
+    // font wins over the paragraph style's.
+    assert_eq!(runs(1), [(strong(), false, arial.clone()), (strong(), true, arial), (Some("TimesStyle".to_owned()), true, times)]);
+}
+
+/// A run's `0x81` in a paragraph whose style turns the property on turns it off: the paragraph
+/// style is the base the operand inverts, though the walk reaches the paragraph's mark, and so its
+/// style, only after the run.
+#[test]
+fn a_toggle_inverts_its_paragraph_styles_value() {
+    let spec = RichSpec {
+        text: "ab\r",
+        styles: vec![(1, 0x0FFF, "Normal", Vec::new(), Vec::new()), (1, 0, "BoldPara", Vec::new(), grpprl(&[(0x0835, &[0x81])]))],
+        fonts: vec!["Times New Roman"],
+        chpx_runs: vec![(0, grpprl(&[(0x0835, &[0x81])])), (1, Vec::new())],
+        papx_entries: vec![(0, 1, Vec::new())],
+    };
+    let doc = read(&rich_doc(&spec)).expect("opens");
+    let p = para0(&doc);
+    let bold: Vec<bool> = p.runs.iter().map(|r| doc.styles.resolve_char(p.props.style.as_deref(), &r.props).bold).collect();
+    assert_eq!(bold, [false, true]);
 }
 
 #[test]
@@ -3106,4 +3485,60 @@ fn formatting_runs_break_where_the_chpx_changes() {
     // "aaaa" bold, "bbbb" plain plus the field's anchor (3 bytes, default formatting), "ccd" bold
     // (the run from the field to CP 20), "d(ee" italic.
     assert_eq!(shape, [(4, Some(true), None), (7, None, None), (3, Some(true), None), (4, None, Some(true))], "{shape:?}");
+}
+
+/// A section's own note options are explicit, whatever the document's: footnotes at the bottom
+/// of the page (`sprmSFpc` 1) and numbered continuously (`sprmSRncFtn` 0) are kept as such, not
+/// as unset. Endnotes restarting each section ignore their start (`sprmSNEdn`), which counts only
+/// with continuous numbering ([MS-DOC] §2.6.4), here given before the restart.
+#[test]
+fn section_note_options_are_explicit() {
+    use craft_wordmodel::section::{NotePos, NoteRestart};
+    let sepx = grpprl(&[(0x303B, &[1]), (0x303C, &[0]), (0x5041, &5u16.to_le_bytes()), (0x303E, &[1]), (0x503F, &3u16.to_le_bytes())]);
+    let spec = StructSpec {
+        text: "a\rb\r",
+        header_stories: vec![],
+        sections: vec![(4, sepx)],
+        chpx_runs: vec![(0, Vec::new())],
+        papx_entries: vec![(0, 0, Vec::new()), (2, 0, Vec::new())],
+        plf_lst: Vec::new(),
+        plf_lfo: Vec::new(),
+        note_stories: vec![],
+        endnote_stories: vec![],
+        extra_pairs: Vec::new(),
+        data_stream: Vec::new(),
+    };
+    let doc = read(&struct_doc(&spec)).expect("opens");
+    let (f, e) = (&doc.last_section.footnote_pr, &doc.last_section.endnote_pr);
+    assert_eq!((f.pos, f.num_restart, f.num_start), (Some(NotePos::PageBottom), Some(NoteRestart::Continuous), Some(3)));
+    assert_eq!((e.num_restart, e.num_start), (Some(NoteRestart::EachSect), None));
+}
+
+/// `sprmCIstd` resets the run to its paragraph style before the style applies ([MS-DOC] §2.6.1),
+/// so bold before it is undone and highlighting, which it keeps, is not: bold then an italic
+/// style is italic, not bold italic. A piece's Prc naming a style is applied after the CHPX, so
+/// its style is the run's, and resets the CHPX's bold too.
+#[test]
+fn a_character_style_resets_the_formatting_before_it() {
+    let styles = vec![(1, 0x0FFF, "Normal", Vec::new(), Vec::new()), (2, 0x0FFF, "Emph", Vec::new(), grpprl(&[(0x0836, &[0x01])]))];
+    let read_with = |chpx: Vec<u8>, extra: RichExtra| {
+        let spec = RichSpec {
+            text: "ab\r",
+            styles: styles.clone(),
+            fonts: vec!["Times New Roman"],
+            chpx_runs: vec![(0, chpx), (2, Vec::new())],
+            papx_entries: vec![(0, 0, Vec::new())],
+        };
+        let doc = read(&rich_doc_with(&spec, &extra)).expect("opens");
+        let p = para0(&doc);
+        let r = p.runs.first().expect("a run");
+        let c = doc.styles.resolve_char(p.props.style.as_deref(), &r.props);
+        (r.props.style.clone(), c.bold, c.italic, r.props.highlight.is_some())
+    };
+    let emph = || Some("Emph".to_owned());
+    let chpx = grpprl(&[(0x0835, &[0x01]), (0x2A0C, &[0x07]), (0x4A30, &1u16.to_le_bytes())]);
+    assert_eq!(read_with(chpx, RichExtra::default()), (emph(), false, true, true));
+    let bold = grpprl(&[(0x0835, &[0x01])]);
+    let prc = grpprl(&[(0x4A30, &1u16.to_le_bytes())]);
+    assert_eq!(read_with(bold, RichExtra { prcs: vec![prc], prm: 0x0001, ..Default::default() }), (emph(), false, true, false));
 }
