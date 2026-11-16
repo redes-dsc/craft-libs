@@ -92,8 +92,28 @@ struct Doc6<'a> {
     para_styles: &'a [u16],
     /// The stylesheet: one entry per style index, `None` for an empty slot.
     styles: &'a [Option<Std<'a>>],
-    /// The main text's length in characters, when it isn't the stored bytes' (16-bit text).
+    /// The main text's length in characters, when it isn't the stored bytes' (16-bit text) less
+    /// the other stories'.
     ccp: Option<u32>,
+    /// The lengths of the footnote, header, macro, comment and endnote stories, whose text follows
+    /// the main text's in `text`.
+    stories: [u32; 5],
+    /// Sections: (end CP, SEPX grpprl of Word 6 section sprms).
+    sections: &'a [(u32, &'a [u8])],
+    /// The header table's CPs (pair 11).
+    hdd: &'a [u32],
+    /// The Dop's first bytes (pair 31).
+    dop: &'a [u8],
+    /// Footnotes and endnotes: (reference CPs, story CPs within their subdocument).
+    footnotes: (&'a [u32], &'a [u32]),
+    endnotes: (&'a [u32], &'a [u32]),
+    /// The footnotes' FRDs as stored, when not 1, 2, ... (0: a custom mark).
+    footnote_frds: Option<&'a [u8]>,
+    /// Comments: (reference CPs, story CPs, the 20-byte ATRDs), and the authors' list (pair 36).
+    comments: (&'a [u32], &'a [u32], &'a [u8]),
+    owners: &'a [u8],
+    /// Other (pair, bytes) structures, appended as they are.
+    raw_pairs: &'a [(usize, &'a [u8])],
 }
 
 fn put16(v: &mut [u8], at: usize, x: u16) {
@@ -154,14 +174,68 @@ fn fkp(w: &mut Vec<u8>, runs: &[(u32, u32, &[u8])], papx: bool, istds: &[u16]) -
 fn word_stream(d: &Doc6) -> Vec<u8> {
     let mut w = vec![0u8; TEXT_AT as usize];
     w.extend_from_slice(d.text);
+    let others: u32 = d.stories.iter().sum();
     let ccp = match (d.ccp, d.pieces) {
         (Some(ccp), _) => ccp,
         (None, pieces) => match pieces {
-            Some(p) => p.iter().map(|(len, _)| len).sum(),
-            None => d.text.len() as u32,
+            Some(p) => p.iter().map(|(len, _)| len).sum::<u32>() - others,
+            None => d.text.len() as u32 - others,
         },
     };
     let mut pairs: Vec<(usize, u32, u32)> = Vec::new();
+    if !d.sections.is_empty() {
+        // Each SEPX (u16 size + grpprl), then the PlcfSed: CPs, then 12-byte SEDs.
+        let mut fcs = Vec::new();
+        for (_, sepx) in d.sections {
+            fcs.push(w.len() as u32);
+            w.extend_from_slice(&(sepx.len() as u16).to_le_bytes());
+            w.extend_from_slice(sepx);
+        }
+        let mut plc: Vec<u8> = 0u32.to_le_bytes().to_vec();
+        for (end, _) in d.sections {
+            plc.extend_from_slice(&end.to_le_bytes());
+        }
+        for fc in fcs {
+            plc.extend_from_slice(&[4, 0]);
+            plc.extend_from_slice(&fc.to_le_bytes());
+            plc.extend_from_slice(&[0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+        }
+        pairs.push((6, w.len() as u32, plc.len() as u32));
+        w.extend_from_slice(&plc);
+    }
+    let mut plc = |w: &mut Vec<u8>, pair: usize, cps: &[u32], data: &[u8]| {
+        if cps.is_empty() {
+            return;
+        }
+        let at = w.len() as u32;
+        for cp in cps {
+            w.extend_from_slice(&cp.to_le_bytes());
+        }
+        w.extend_from_slice(data);
+        pairs.push((pair, at, w.len() as u32 - at));
+    };
+    plc(&mut w, 11, d.hdd, &[]);
+    plc(&mut w, 31, &[], &[]);
+    // References: CPs, then a 2-byte FRD (1, 2, ...: auto-numbered) each but the limit's.
+    let frds = |n: usize| (1..n as u16).flat_map(|i| i.to_le_bytes()).collect::<Vec<u8>>();
+    plc(&mut w, 2, d.footnotes.0, &d.footnote_frds.map_or_else(|| frds(d.footnotes.0.len()), <[u8]>::to_vec));
+    plc(&mut w, 4, d.comments.0, d.comments.2);
+    plc(&mut w, 5, d.comments.1, &[]);
+    plc(&mut w, 3, d.footnotes.1, &[]);
+    plc(&mut w, 46, d.endnotes.0, &frds(d.endnotes.0.len()));
+    plc(&mut w, 47, d.endnotes.1, &[]);
+    for (pair, bytes) in d.raw_pairs {
+        pairs.push((*pair, w.len() as u32, bytes.len() as u32));
+        w.extend_from_slice(bytes);
+    }
+    if !d.owners.is_empty() {
+        pairs.push((36, w.len() as u32, d.owners.len() as u32));
+        w.extend_from_slice(d.owners);
+    }
+    if !d.dop.is_empty() {
+        pairs.push((31, w.len() as u32, d.dop.len() as u32));
+        w.extend_from_slice(d.dop);
+    }
     for (pair, runs, papx) in [(12, d.runs, false), (13, d.paras, true)] {
         let (fc, lcb) = fkp(&mut w, runs, papx, d.para_styles);
         if lcb > 0 {
@@ -224,9 +298,14 @@ fn word_stream(d: &Doc6) -> Vec<u8> {
     let len = w.len() as u32;
     put32(&mut w, 0x20, len);
     put32(&mut w, 0x34, ccp);
+    for (k, n) in d.stories.iter().enumerate() {
+        put32(&mut w, 0x38 + 4 * k, *n);
+    }
     for (i, fc, lcb) in pairs {
-        put32(&mut w, 0x58 + i * 8, fc);
-        put32(&mut w, 0x58 + i * 8 + 4, lcb);
+        // From index 38 on, the pairs sit 10 bytes later.
+        let at = 0x58 + i * 8 + if i >= 38 { 10 } else { 0 };
+        put32(&mut w, at, fc);
+        put32(&mut w, at + 4, lcb);
     }
     w
 }
@@ -499,9 +578,9 @@ fn character_formatting_is_read() {
 
 #[test]
 fn unseen_operand_values_are_left_unread() {
-    // Underline 3 and "multiple" line spacing were never seen in a real file, so they aren't
-    // guessed at.
-    let runs: &[(u32, u32, &[u8])] = &[(0, 3, &[0x5E, 0x03])];
+    // Underline 6 (Word 97's thick) and "multiple" line spacing were never seen in a file Word 95
+    // wrote, so they aren't guessed at.
+    let runs: &[(u32, u32, &[u8])] = &[(0, 3, &[0x5E, 0x06])];
     let paras: &[(u32, u32, &[u8])] = &[(0, 3, &[0x14, 0xF0, 0x00, 0x01, 0x00])];
     let doc = read(&word6_file(&Doc6 { text: b"Hi\r", runs, paras, ..Default::default() })).expect("opens");
     let p = first_para(&doc);
@@ -532,6 +611,146 @@ fn paragraph_formatting_is_read() {
     assert_eq!((p.indent_left, p.indent_right, p.indent_first), (Some(36.0), Some(18.0), Some(-36.0)));
     assert_eq!(p.line_spacing, Some(craft_wordmodel::props::LineSpacing::AtLeast(27.0)));
     assert_eq!(ps[1].props.align, Some(craft_wordmodel::props::Align::Center));
+}
+
+/// The paragraph sprms Word 95 wrote for one property each (`para.doc`), as Word 2016 reads them
+/// (its `.docx`): widow control off; 12 pt before and 18 pt after; keep together, keep with next
+/// and page break before; no line numbers; no hyphenation; and a paragraph of a style that keeps
+/// its lines together and has 6 pt before, turning both off (with the PAPX's padding byte). A
+/// paragraph with none of them keeps widow control on, Word 95's default.
+#[test]
+fn paragraph_spacing_keep_and_widow_control_are_read() {
+    let paras: &[(u32, u32, &[u8])] = &[
+        (0, 2, &[0x33, 0x00]),
+        (2, 4, &[0x15, 0xF0, 0x00, 0x16, 0x68, 0x01]),
+        (4, 6, &[0x07, 0x01, 0x08, 0x01, 0x09, 0x01]),
+        (6, 8, &[0x0E, 0x01]),
+        (8, 10, &[0x2C, 0x01]),
+        (10, 12, &[0x07, 0x00, 0x15, 0x00, 0x00, 0x00]),
+        (12, 14, &[]),
+    ];
+    let styles = &[
+        Some(Std { sgc: 1, base: 0x0FFF, name: "Normal", ..Default::default() }),
+        Some(Std {
+            sti: 0x0FFE,
+            sgc: 1,
+            base: 0,
+            name: "Spaced",
+            papx: &[0x07, 0x01, 0x08, 0x01, 0x15, 0x78, 0x00, 0x16, 0x3C, 0x00],
+            ..Default::default()
+        }),
+    ];
+    let d = Doc6 { text: b"a\rb\rc\rd\re\rf\rg\r", paras, para_styles: &[0, 0, 0, 0, 0, 1, 0], styles, ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    let ps: Vec<_> = doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.props.clone()).collect();
+    assert_eq!(ps[0].widow_control, Some(false));
+    assert_eq!((ps[1].space_before, ps[1].space_after), (Some(12.0), Some(18.0)));
+    assert_eq!((ps[2].keep_lines, ps[2].keep_next, ps[2].page_break_before), (Some(true), Some(true), Some(true)));
+    assert_eq!(ps[3].suppress_line_numbers, Some(true));
+    assert_eq!(ps[4].suppress_hyphens, Some(true));
+    assert_eq!((ps[5].keep_lines, ps[5].space_before), (Some(false), Some(0.0)));
+    assert_eq!(ps[6].widow_control, None);
+    let spaced = doc.styles.styles.iter().find(|s| s.name == "Spaced").expect("style");
+    assert_eq!(
+        (spaced.para.keep_lines, spaced.para.keep_next, spaced.para.space_before, spaced.para.space_after),
+        (Some(true), Some(true), Some(6.0), Some(3.0))
+    );
+}
+
+/// Tab stops as Word 95 wrote them (`tabs.doc`): 25 pt left, 150 pt centred and 300 pt right with
+/// a dot leader in one paragraph; and in a paragraph of a style with stops at 50 pt and 250 pt
+/// (right), the 50 pt one removed and one at 100 pt added. Word 2016 reads the same stops.
+#[test]
+fn tab_stops_are_read() {
+    use craft_wordmodel::props::{TabAlign, TabLeader};
+    let multi: &[u8] = &[0x0F, 0x0B, 0x00, 0x03, 0xF4, 0x01, 0xB8, 0x0B, 0x70, 0x17, 0x00, 0x01, 0x0A, 0x00];
+    let changed: &[u8] = &[0x0F, 0x07, 0x01, 0xE8, 0x03, 0x01, 0xD0, 0x07, 0x00, 0x00];
+    let paras: &[(u32, u32, &[u8])] = &[(0, 2, multi), (2, 4, changed)];
+    let styles = &[
+        Some(Std { sgc: 1, base: 0x0FFF, name: "Normal", ..Default::default() }),
+        Some(Std {
+            sti: 0x0FFE,
+            sgc: 1,
+            base: 0,
+            name: "Tabbed",
+            papx: &[0x0F, 0x08, 0x00, 0x02, 0xE8, 0x03, 0x88, 0x13, 0x00, 0x02],
+            ..Default::default()
+        }),
+    ];
+    let d = Doc6 { text: b"a\rb\r", paras, para_styles: &[0, 1], styles, ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    let tabs = |i: usize| -> Vec<(f32, TabAlign, TabLeader)> {
+        let p = doc.body.iter().filter_map(|b| b.as_para()).nth(i).expect("para");
+        p.props.tabs.iter().flatten().map(|t| (t.pos, t.align, t.leader)).collect()
+    };
+    assert_eq!(
+        tabs(0),
+        [(25.0, TabAlign::Left, TabLeader::None), (150.0, TabAlign::Center, TabLeader::None), (300.0, TabAlign::Right, TabLeader::Dot)]
+    );
+    assert_eq!(tabs(1), [(50.0, TabAlign::Clear, TabLeader::None), (100.0, TabAlign::Left, TabLeader::None)]);
+    let tabbed = doc.styles.styles.iter().find(|s| s.name == "Tabbed").expect("style");
+    let style_tabs: Vec<_> = tabbed.para.tabs.iter().flatten().map(|t| (t.pos, t.align)).collect();
+    assert_eq!(style_tabs, [(50.0, TabAlign::Left), (250.0, TabAlign::Right)]);
+}
+
+/// The character sprms Word 95 wrote for one property each (`chr.doc`), as Word 2016 reads them:
+/// superscript, subscript, raised 3 pt and lowered 2 pt (a position, not superscript), hidden,
+/// expanded 1 pt and condensed 0.5 pt, kerning from 12 pt, strikethrough, outline, shadow, and
+/// double underline. The toggles are 0x81, as Word 95 writes them over a plain style.
+#[test]
+fn character_effects_position_spacing_and_kerning_are_read() {
+    use craft_wordmodel::props::{Underline, VertAlign};
+    let runs: &[(u32, u32, &[u8])] = &[
+        (0, 1, &[0x68, 0x01]),
+        (1, 2, &[0x68, 0x02]),
+        (2, 3, &[0x65, 0x06, 0x00]),
+        (3, 4, &[0x65, 0xFC, 0xFF]),
+        (4, 5, &[0x5C, 0x81]),
+        (5, 6, &[0x60, 0x14, 0x00]),
+        (6, 7, &[0x60, 0xF6, 0xFF]),
+        (7, 8, &[0x6B, 0x18, 0x00]),
+        (8, 9, &[0x57, 0x81]),
+        (9, 10, &[0x58, 0x81]),
+        (10, 11, &[0x59, 0x81]),
+        (11, 12, &[0x5E, 0x03]),
+        (12, 13, &[]),
+    ];
+    let doc = read(&word6_file(&Doc6 { text: b"abcdefghijkl\r", runs, ..Default::default() })).expect("opens");
+    let r: Vec<_> = first_para(&doc).runs.iter().map(|r| r.props.clone()).collect();
+    assert_eq!((r[0].vert_align, r[1].vert_align), (Some(VertAlign::Superscript), Some(VertAlign::Subscript)));
+    assert_eq!((r[2].position, r[3].position, r[2].vert_align), (Some(3.0), Some(-2.0), None));
+    assert_eq!(r[4].hidden, Some(true));
+    assert_eq!((r[5].spacing, r[6].spacing), (Some(1.0), Some(-0.5)));
+    assert_eq!(r[7].kern, Some(12.0));
+    assert_eq!((r[8].strike, r[9].outline, r[10].shadow), (Some(true), Some(true), Some(true)));
+    assert_eq!(r[11].underline, Some(Underline::Double));
+}
+
+/// Character styles as Word 95 writes them (`cs.doc`) and Word 2016 shows them: 0x50 names the
+/// run's style; in a bold paragraph style, a bold character style is not bold, and `55 81` over
+/// it is.
+#[test]
+fn character_styles_apply_to_their_runs() {
+    let runs: &[(u32, u32, &[u8])] =
+        &[(0, 1, &[0x50, 0x02, 0x00]), (1, 2, &[0x50, 0x02, 0x00, 0x55, 0x81]), (2, 4, &[]), (4, 5, &[0x50, 0x02, 0x00]), (5, 6, &[])];
+    let paras: &[(u32, u32, &[u8])] = &[(0, 4, &[]), (4, 6, &[])];
+    let styles = &[
+        Some(Std { sgc: 1, base: 0x0FFF, name: "Normal", ..Default::default() }),
+        Some(Std { sti: 0x0FFE, sgc: 1, base: 0, name: "BoldPara", chpx: &[0x55, 0x81], ..Default::default() }),
+        Some(Std { sti: 0x0FFE, sgc: 2, base: 0x0FFF, name: "MyStrong", chpx: &[0x55, 0x81, 0x62, 0x06], ..Default::default() }),
+    ];
+    let d = Doc6 { text: b"abc\rd\r", runs, paras, para_styles: &[1, 0], styles, ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    let ps: Vec<_> = doc.body.iter().filter_map(|b| b.as_para()).collect();
+    let runs = |i: usize| -> Vec<(Option<String>, bool)> {
+        let p = ps[i];
+        p.runs.iter().map(|r| (r.props.style.clone(), doc.styles.resolve_char(p.props.style.as_deref(), &r.props).bold)).collect()
+    };
+    let strong = || Some("MyStrong".to_owned());
+    assert_eq!(runs(0), [(strong(), false), (strong(), true), (None, true)]);
+    assert_eq!(runs(1), [(strong(), true)]);
+    let style = doc.styles.get("MyStrong").expect("MyStrong");
+    assert_eq!(style.kind, craft_wordmodel::styles::StyleKind::Character);
 }
 
 /// A Word 6 table definition sprm (0xBE): the cell edges, then a 10-byte descriptor per cell
@@ -578,6 +797,112 @@ fn table_rows_and_merged_cells_are_read() {
     let doc = read(&word6_file(&Doc6 { text, paras, ..Default::default() })).expect("opens");
     assert_eq!(table_rows(&doc), [vec!["A", "B"], vec!["C"]]);
     assert_eq!(body_texts(&doc), ["after"], "the paragraph after the table stays outside it");
+}
+
+/// Paragraph borders and shading in the bytes Word 95 writes (`bs.doc`), read as Word 2016
+/// shows them: a thick 2 (`26 12 00`) is a 3 pt single line, a double red (`28 99 01`), a dotted
+/// blue (`27 86 00`), a hairline (`26 16 00`, 1/4 pt), a single with 4 pt of space (`26 09 20`),
+/// the between border (0x2A) and the shading after it, solid yellow (`2F 07 04`), a clear yellow
+/// fill (`2F E0 00`), and a bottom border of none (`28 00 00`) that turns off its style's.
+#[test]
+fn paragraph_borders_and_shading_are_read() {
+    use craft_wordmodel::Rgb;
+    use craft_wordmodel::props::{Border, BorderStyle};
+    let paras: &[(u32, u32, &[u8])] = &[
+        (0, 2, &[0x26, 0x12, 0x00]),
+        (2, 4, &[0x28, 0x99, 0x01]),
+        (4, 6, &[0x27, 0x86, 0x00]),
+        (6, 8, &[0x26, 0x16, 0x00]),
+        (8, 10, &[0x26, 0x09, 0x20]),
+        (10, 12, &[0x26, 0x09, 0x00, 0x28, 0x09, 0x00, 0x2A, 0x09, 0x00, 0x2F, 0x07, 0x04]),
+        (12, 14, &[0x2F, 0xE0, 0x00]),
+        (14, 16, &[0x28, 0x00, 0x00]),
+    ];
+    let styles = &[Some(Std { sgc: 1, base: 0x0FFF, name: "Normal", papx: &[0x28, 0x09, 0x00], ..Default::default() })];
+    let d = Doc6 { text: b"a\rb\rc\rd\re\rf\rg\rh\r", paras, styles, ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    let ps: Vec<_> = doc.body.iter().filter_map(|b| b.as_para()).map(|p| p.props.clone()).collect();
+    let line = |style, width, color, space| Some(Border { style, width, color, space });
+    let side = |i: usize, f: fn(&craft_wordmodel::props::Borders) -> Option<Border>| ps[i].borders.as_ref().and_then(f);
+    assert_eq!(side(0, |b| b.top), line(BorderStyle::Single, 3.0, None, 0.0));
+    assert_eq!(side(1, |b| b.bottom), line(BorderStyle::Double, 0.75, Some(Rgb(255, 0, 0)), 0.0));
+    assert_eq!(side(2, |b| b.left), line(BorderStyle::Dotted, 0.75, Some(Rgb(0, 0, 255)), 0.0));
+    assert_eq!(side(3, |b| b.top), line(BorderStyle::Single, 0.25, None, 0.0));
+    assert_eq!(side(4, |b| b.top), line(BorderStyle::Single, 0.75, None, 4.0));
+    assert_eq!(side(5, |b| b.between), line(BorderStyle::Single, 0.75, None, 0.0));
+    assert_eq!(ps[5].shading, Some(Rgb(255, 255, 0)), "the sprm after 0x2A is read");
+    assert_eq!(ps[6].shading, Some(Rgb(255, 255, 0)));
+    assert_eq!(side(7, |b| b.bottom).map(|b| b.style), Some(BorderStyle::None));
+    let normal = doc.styles.get("Normal").expect("Normal");
+    assert_eq!(normal.para.borders.and_then(|b| b.bottom), line(BorderStyle::Single, 0.75, None, 0.0));
+}
+
+/// Every Word 6 BRC width and type, as Word 2016 reads them from a Word 95 file whose borders were
+/// set to each value in turn: type 0 is none, except widths 6 and 7; a thick line is single at
+/// twice the width; width 0 counts as 1; and the shadow bit changes neither.
+#[test]
+fn every_brc_width_and_type_reads_as_word_shows_it() {
+    use craft_wordmodel::props::BorderStyle as S;
+    for v in 0u16..64 {
+        let (width, kind) = (v & 7, (v >> 3) & 3);
+        let want = match (width, kind) {
+            (6, 2) => Some((S::Single, 0.25)),
+            (6, _) => Some((S::Dotted, 0.75)),
+            (7, _) => Some((S::Dashed, 0.75)),
+            (_, 0) => None,
+            (w, 1) => Some((S::Single, 0.75 * w.max(1) as f32)),
+            (w, 2) => Some((S::Single, 1.5 * w.max(1) as f32)),
+            (w, _) => Some((S::Double, 0.75 * w.max(1) as f32)),
+        };
+        let grpprl = [0x26, v as u8, 0];
+        let paras: &[(u32, u32, &[u8])] = &[(0, 2, &grpprl)];
+        let doc = read(&word6_file(&Doc6 { text: b"a\r", paras, ..Default::default() })).expect("opens");
+        let p = doc.body.iter().find_map(|b| b.as_para()).expect("paragraph");
+        let got = p.props.borders.and_then(|b| b.top).filter(|b| b.style != S::None).map(|b| (b.style, b.width));
+        assert_eq!(got, want, "BRC {v:#04x}");
+    }
+}
+
+/// Cell borders and shading in the bytes Word 95 writes (`bs.doc`'s first row): the BRCs after
+/// each cell's flags in the table definition (a box, a thick top and double red bottom, a dotted
+/// blue left, a hairline right), and 0xBF's `Shd80` per cell (none, 25%, solid yellow, a clear
+/// silver fill).
+#[test]
+fn cell_borders_and_shading_are_read() {
+    use craft_wordmodel::Rgb;
+    use craft_wordmodel::props::BorderStyle as S;
+    let cells: [[u16; 4]; 4] = [[0x09; 4], [0x12, 0, 0x199, 0], [0, 0x86, 0, 0], [0, 0, 0, 0x16]];
+    let mut rest = vec![4u8];
+    for e in [0i16, 2000, 4000, 6000, 8000] {
+        rest.extend_from_slice(&e.to_le_bytes());
+    }
+    for c in cells {
+        rest.extend_from_slice(&[0, 0]);
+        for b in c {
+            rest.extend_from_slice(&b.to_le_bytes());
+        }
+    }
+    let mut row = vec![0x18, 1, 0x19, 1, 0xBE];
+    row.extend_from_slice(&((rest.len() + 1) as u16).to_le_bytes());
+    row.extend(rest);
+    row.extend([0xBF, 8, 0x00, 0x00, 0x00, 0x14, 0x07, 0x04, 0x00, 0x02]);
+    let text = b"A\x07B\x07C\x07D\x07\x07";
+    let cell: &[u8] = &[0x18, 1];
+    let paras: &[(u32, u32, &[u8])] = &[(0, 2, cell), (2, 4, cell), (4, 6, cell), (6, 8, cell), (8, 9, &row)];
+    let doc = read(&word6_file(&Doc6 { text, paras, ..Default::default() })).expect("opens");
+    let t = doc.body.iter().find_map(|b| b.as_table()).expect("a table");
+    let c = &t.rows[0].cells;
+    let side = |b: Option<craft_wordmodel::props::Border>| b.map(|b| (b.style, b.width, b.color));
+    let b: Vec<_> = c.iter().map(|c| c.props.borders.unwrap_or_default()).collect();
+    assert_eq!([side(b[0].top), side(b[0].left), side(b[0].bottom), side(b[0].right)], [Some((S::Single, 0.75, None)); 4]);
+    assert_eq!(
+        (side(b[1].top), side(b[1].bottom), b[1].left, b[1].right),
+        (Some((S::Single, 3.0, None)), Some((S::Double, 0.75, Some(Rgb(255, 0, 0)))), None, None)
+    );
+    assert_eq!((side(b[2].left), b[2].top), (Some((S::Dotted, 0.75, Some(Rgb(0, 0, 255)))), None));
+    assert_eq!((side(b[3].right), b[3].top), (Some((S::Single, 0.25, None)), None));
+    let shading: Vec<_> = c.iter().map(|c| c.props.shading).collect();
+    assert_eq!(shading, [None, None, Some(Rgb(255, 255, 0)), Some(Rgb(192, 192, 192))]);
 }
 
 #[test]
@@ -706,13 +1031,22 @@ fn full_stream() -> Vec<u8> {
     ];
     let paras: &[(u32, u32, &[u8])] = &[(0, 6, &[]), (6, 12, &[])];
     word_stream(&Doc6 {
-        text: b"Hello\r\xC4\xE0\rx\r\r",
+        // The main text, then a footnote's story, a header's, and the final mark.
+        text: b"Hello\r\xC4\xE0\rx\x02\r\x02F\rH\r\r\r",
         fonts: FONTS,
         runs,
         paras,
         para_styles: &[2, 0],
         styles,
-        pieces: Some(&[(6, 0), (6, 6)]),
+        pieces: Some(&[(6, 0), (13, 6)]),
+        ccp: Some(12),
+        stories: [3, 3, 0, 0, 0],
+        sections: &[(19, &[0x8E, 0x00, 0x99, 0x02])],
+        hdd: &[0, 3, 4],
+        footnotes: (&[10, 12], &[0, 3, 4]),
+        // A custom-mark FRD (its reference is 0x02, so it stays a numbered one) and a Dop.
+        footnote_frds: Some(&[0, 0]),
+        dop: &[0x43, 0x00, 0x0E, 0x00],
         ..Default::default()
     })
 }
@@ -721,8 +1055,10 @@ fn full_stream() -> Vec<u8> {
 fn the_full_fixture_reads() {
     let f = cfb_file(&[("WordDocument", &full_stream())]);
     let doc = read(&f).expect("opens");
-    assert_eq!(body_texts(&doc), ["Hello", "Да", "x", ""]);
+    assert_eq!(body_texts(&doc), ["Hello", "Да", "x\u{FFFC}"]);
     assert_eq!(style_names(&doc)[0], "Mine");
+    assert_eq!(part_text(&doc, doc.last_section.headers.default), Some("H".into()));
+    assert_eq!(notes_of(&doc).len(), 1);
 }
 
 proptest! {
@@ -744,4 +1080,430 @@ proptest! {
         let w = full_stream();
         let _ = read(&cfb_file(&[("WordDocument", &w[..n.min(w.len())])]));
     }
+}
+
+/// The paragraphs' text and the section each ends, if any.
+fn sections_of(doc: &craft_wordmodel::Document) -> Vec<craft_wordmodel::section::SectionProps> {
+    let mut out: Vec<_> = doc.body.iter().filter_map(|b| b.as_para()?.section.as_deref().cloned()).collect();
+    out.push(doc.last_section.clone());
+    out
+}
+
+/// A part's paragraphs' text.
+fn part_text(doc: &craft_wordmodel::Document, id: Option<u32>) -> Option<String> {
+    let part = doc.parts.get(&id?)?;
+    Some(part.blocks.iter().filter_map(|b| b.as_para().map(|p| p.text.clone())).collect::<Vec<_>>().join("|"))
+}
+
+#[test]
+fn sections_take_their_properties() {
+    // As Word 95 writes them (`secprops`, `sectypes`): section 2 starts on the same page and is
+    // landscape (0x8E 0, 0xA2 2, page 15840 x 12240); section 3 has 3 columns 360 apart and its
+    // own margins (0x90, 0x91, 0xA6-0xA9) and header/footer distances (0x9C, 0x9D), and starts
+    // on an odd page (0x8E 4). Word shows each so.
+    let s2: &[u8] = &[0x8E, 0x00, 0xA2, 0x02, 0xA4, 0xE0, 0x3D, 0xA5, 0xD0, 0x2F];
+    let s3: &[u8] = &[
+        0x8E, 0x04, 0x90, 0x02, 0x00, 0x91, 0x68, 0x01, 0x9C, 0x38, 0x04, 0x9D, 0x84, 0x03, 0xA6, 0x40, 0x0B, 0xA7, 0xD0, 0x02, 0xA8, 0x70, 0x08,
+        0xA9, 0x38, 0x04,
+    ];
+    let d = Doc6 { text: b"One\r\x0cTwo\r\x0cThree\r", sections: &[(5, &[]), (10, s2), (16, s3)], ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    assert_eq!(body_texts(&doc), ["One", "", "Two", "", "Three"]);
+    let s = sections_of(&doc);
+    assert_eq!(s.len(), 3);
+    use craft_wordmodel::section::SectionStart;
+    assert_eq!((s[0].start, s[0].landscape, s[0].page_w), (SectionStart::NextPage, false, 612.0));
+    assert_eq!((s[1].start, s[1].landscape, s[1].page_w, s[1].page_h), (SectionStart::Continuous, true, 792.0, 612.0));
+    assert_eq!((s[2].start, s[2].columns.count, s[2].columns.space), (SectionStart::OddPage, 3, 18.0));
+    assert_eq!((s[2].margin_left, s[2].margin_right, s[2].margin_top, s[2].margin_bottom), (144.0, 36.0, 108.0, 54.0));
+    assert_eq!((s[2].header, s[2].footer), (54.0, 45.0));
+}
+
+#[test]
+fn the_final_section_is_the_one_reaching_the_end_of_the_text() {
+    // A malformed PlcfSed with a third section past the text: the second, which reaches the end
+    // of the text (CP 9), is the final one, and the third is ignored, as the paragraphs before
+    // it are given their sections.
+    let landscape: &[u8] = &[0xA2, 0x02, 0xA4, 0xE0, 0x3D, 0xA5, 0xD0, 0x2F];
+    let d = Doc6 { text: b"One\r\x0cTwo\r", sections: &[(5, &[]), (9, landscape), (14, &[])], ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    assert!(doc.last_section.landscape);
+}
+
+#[test]
+fn the_header_table_holds_only_the_stories_a_section_names() {
+    // As `hf3`: one section naming all six stories (0x99 = 0x3F), stored in the order even header,
+    // odd header, even footer, odd footer, first header, first footer, each with its guard mark.
+    let text = b"Body\rHE\r\rHO\r\rFE\r\rFO\r\rHF\r\rFF\r\r\r";
+    let hdd: &[u32] = &[0, 4, 8, 12, 16, 20, 24, 25];
+    let d = Doc6 { text, stories: [0, 25, 0, 0, 0], sections: &[(30, &[0x8F, 0x01, 0x99, 0x3F])], hdd, ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    let s = &doc.last_section;
+    assert!(s.title_page);
+    let got = [s.headers.even, s.headers.default, s.footers.even, s.footers.default, s.headers.first, s.footers.first].map(|id| part_text(&doc, id));
+    assert_eq!(got, ["HE", "HO", "FE", "FO", "HF", "FF"].map(|t| Some(t.to_string())));
+}
+
+#[test]
+fn a_story_a_section_doesnt_name_is_the_previous_sections() {
+    // As `hfsec`: section 1 names its odd header and footer (0x0A), section 2 only its header
+    // (0x02). The table holds three stories; Word shows section 2's footer linked to section 1's.
+    let text = b"One\r\x0cTwo\rH1\r\rF1\r\rH2\r\r\r";
+    let hdd: &[u32] = &[0, 4, 8, 12, 13];
+    let d = Doc6 { text, stories: [0, 13, 0, 0, 0], sections: &[(5, &[0x99, 0x0A]), (22, &[0x99, 0x02])], hdd, ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    let s = sections_of(&doc);
+    assert_eq!((part_text(&doc, s[0].headers.default), part_text(&doc, s[0].footers.default)), (Some("H1".into()), Some("F1".into())));
+    assert_eq!((part_text(&doc, s[1].headers.default), s[1].footers.default), (Some("H2".into()), None));
+}
+
+#[test]
+fn separator_stories_come_first() {
+    // As `seps`: the Dop's byte 1 names a footnote separator (bit 0); it comes before the
+    // section's header in the table, and isn't a header.
+    let text = b"Body\rSEP\r\rHDR\r\r\r";
+    let hdd: &[u32] = &[0, 5, 10, 11];
+    let d = Doc6 { text, stories: [0, 11, 0, 0, 0], sections: &[(16, &[0x99, 0x02])], hdd, dop: &[0x02, 0x01, 0x04, 0x00], ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    assert_eq!(part_text(&doc, doc.last_section.headers.default), Some("HDR".into()));
+    // ... and it is the document's footnote separator.
+    let sep = doc.footnote_separators.separator.as_ref().and_then(|b| b.first()).and_then(|b| b.as_para()).map(|p| p.text.clone());
+    assert_eq!(sep.as_deref(), Some("SEP"));
+}
+
+#[test]
+fn a_fast_saved_section_mark_adds_its_pieces_sprms() {
+    // As `cn.orthodox…DOC`: the SEPX doesn't name the title page or the header; the Prc of the
+    // piece holding the last section's mark (its last CP, after every story) does (8F 01, 99 02).
+    // Word shows both.
+    let text = b"Body\rHDR\r\r\r";
+    let pieces: &[(u32, u32)] = &[(5, 0), (5, 5), (1, 10)];
+    let d = Doc6 {
+        text,
+        pieces: Some(pieces),
+        prms: &[0, 0, 0x0001],
+        prcs: &[&[0x8F, 0x01, 0x99, 0x02]],
+        ccp: Some(5),
+        stories: [0, 5, 0, 0, 0],
+        sections: &[(11, &[0xA1, 0x01, 0x00])],
+        hdd: &[0, 5, 6],
+        ..Default::default()
+    };
+    let doc = read(&word6_file(&d)).expect("opens");
+    assert!(doc.last_section.title_page);
+    assert_eq!(part_text(&doc, doc.last_section.headers.default), Some("HDR".into()));
+}
+
+/// Each note reference's kind and text, in body order.
+fn notes_of(doc: &craft_wordmodel::Document) -> Vec<(craft_wordmodel::para::NoteKind, String)> {
+    let mut out = Vec::new();
+    for p in doc.body.iter().filter_map(|b| b.as_para()) {
+        for o in &p.objects {
+            if let craft_wordmodel::para::InlineObject::NoteRef { kind, id, .. } = o {
+                out.push((*kind, part_text(doc, Some(*id)).unwrap_or_default()));
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn footnotes_and_endnotes_are_read() {
+    // As `fnen`: two footnotes (pairs 2 and 3) and an endnote (pairs 46 and 47, after the gap in
+    // the pairs), each story after the main text in its own subdocument.
+    use craft_wordmodel::para::NoteKind;
+    let text = b"A\x02 B\x02 C\x02\r\x02 F1\r\x02 F3\r\r\x02 E2\r\r\r";
+    let d =
+        Doc6 { text, stories: [11, 0, 0, 0, 7], footnotes: (&[1, 7, 12], &[0, 5, 10, 11]), endnotes: (&[4, 12], &[0, 5, 7]), ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    // A note story's own reference mark links to nothing, so only the space after it is kept.
+    let want = [(NoteKind::Footnote, " F1"), (NoteKind::Endnote, " E2"), (NoteKind::Footnote, " F3")].map(|(k, t)| (k, t.to_string()));
+    assert_eq!(notes_of(&doc), want);
+}
+
+#[test]
+fn a_comment_at_the_end_of_the_text_closes_in_the_last_paragraph() {
+    // A comment whose reference CP is the end of the main text (6, past its last paragraph
+    // mark): its start and end were queued there, and the walk stopped before emitting them.
+    // Both now close the last paragraph, as Word ends a range there.
+    use craft_wordmodel::para::InlineObject;
+    let mut atrd = vec![0u8; 20];
+    atrd[16..20].copy_from_slice(&[0xFF; 4]);
+    let d = Doc6 {
+        text: b"Alpha\r\x05 C\r\r",
+        stories: [0, 0, 0, 5, 0],
+        comments: (&[6, 7], &[0, 4, 5], &atrd),
+        owners: b"\x03Ann",
+        ..Default::default()
+    };
+    let doc = read(&word6_file(&d)).expect("opens");
+    let p = first_para(&doc);
+    assert_eq!(p.text, "Alpha\u{FFFC}\u{FFFC}");
+    let ends: Vec<bool> = p.objects.iter().map(|o| matches!(o, InlineObject::CommentEnd { .. })).collect();
+    assert_eq!(ends, [false, true]);
+    assert_eq!(doc.body.len(), 1, "no paragraph of their own");
+}
+
+#[test]
+fn comments_are_read_and_anchored_at_their_references() {
+    // As Word 95 writes two comments (`atn2`): 0x05 at each reference, the stories after the main
+    // text in the comment subdocument (0x44), 20-byte ATRDs and 8-bit authors. Word reads Bob
+    // Brown/BB and Ann Able/AA, no date, each covering its reference's place.
+    use craft_wordmodel::para::InlineObject;
+    let atrd = |initials: &[u8], ibst: u8| {
+        let mut v = vec![0u8; 20];
+        v[0] = initials.len() as u8;
+        v[1..1 + initials.len()].copy_from_slice(initials);
+        v[10] = ibst;
+        v[16..20].copy_from_slice(&[0xFF; 4]);
+        v
+    };
+    let atrds = [atrd(b"BB", 0), atrd(b"AA", 1)].concat();
+    let text = b"Alpha\x05 beta\x05\r\x05 C-BOB\r\x05 C-ANN\r\r";
+    let d = Doc6 {
+        text,
+        stories: [0, 0, 0, 17, 0],
+        comments: (&[5, 11, 13], &[0, 8, 16, 17], &atrds),
+        owners: b"\x09Bob Brown\x08Ann Able",
+        ..Default::default()
+    };
+    let doc = read(&word6_file(&d)).expect("opens");
+    let p = first_para(&doc);
+    assert_eq!(p.text, "Alpha\u{FFFC}\u{FFFC} beta\u{FFFC}\u{FFFC}");
+    let anchors: Vec<_> = p
+        .objects
+        .iter()
+        .map(|o| match o {
+            InlineObject::CommentStart { id } => format!("<{id}"),
+            InlineObject::CommentEnd { id } => format!("{id}>"),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(anchors, ["<0", "0>", "<1", "1>"]);
+    let comments: Vec<_> =
+        doc.comments.values().map(|c| (c.author.as_str(), c.initials.as_str(), c.date.as_str(), part_text(&doc, Some(c.part)))).collect();
+    assert_eq!(comments, [("Bob Brown", "BB", "", Some(" C-BOB".into())), ("Ann Able", "AA", "", Some(" C-ANN".into()))]);
+}
+
+#[test]
+fn a_custom_note_mark_is_read_as_the_mark() {
+    // As Word 95 writes a footnote marked "*" (`fn`): FRD 0, the "*" at the reference in its own
+    // run, and again at the start of the note's text. Word reads a custom mark "*".
+    let text = b"Alpha* end\r* FN\r\r";
+    let runs: &[(u32, u32, &[u8])] = &[(0, 5, &[]), (5, 6, &[0x55, 0x01]), (6, 17, &[])];
+    let d = Doc6 { text, runs, stories: [6, 0, 0, 0, 0], footnotes: (&[5, 12], &[0, 5, 6]), footnote_frds: Some(&[0, 0]), ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    let p = first_para(&doc);
+    assert_eq!(p.text, "Alpha\u{FFFC} end");
+    let craft_wordmodel::para::InlineObject::NoteRef { custom, id, .. } = p.objects.first().expect("a note") else { panic!("not a note") };
+    assert_eq!((custom.as_str(), part_text(&doc, Some(*id))), ("*", Some("* FN".into())));
+}
+
+#[test]
+fn note_options_and_facing_pages_come_from_the_dop() {
+    // As Word 95 writes them (`noteopts`, `hf3`): Dop byte 0 0x43 (facing pages, fpc 2), rncFtn 2
+    // and nFtn 3 at 2, nEdn 2 at 0x34, and at 0x36 epc 0 with nfcFtnRef 2 and nfcEdnRef 3 (0x00C8).
+    // Word reads footnotes beneath the text, i ii iii from iii restarting each page, endnotes at
+    // the end of each section, A B C from B, and different odd and even pages.
+    use craft_wordmodel::section::{NotePos, NoteRestart, NumFormat};
+    let mut dop = vec![0u8; 0x58];
+    dop[0] = 0x43;
+    dop[2..4].copy_from_slice(&0x000Eu16.to_le_bytes());
+    dop[0x34..0x36].copy_from_slice(&0x0008u16.to_le_bytes());
+    dop[0x36..0x38].copy_from_slice(&0x00C8u16.to_le_bytes());
+    let d = Doc6 { text: b"Text\r", dop: &dop, ..Default::default() };
+    let st = read(&word6_file(&d)).expect("opens").settings;
+    assert!(st.even_odd_headers);
+    let ftn = (st.footnote_pr.pos, st.footnote_pr.num_start, st.footnote_pr.num_restart, st.footnote_format);
+    assert_eq!(ftn, (Some(NotePos::BeneathText), Some(3), Some(NoteRestart::EachPage), NumFormat::LowerRoman));
+    assert_eq!((st.endnote_pr.pos, st.endnote_pr.num_start, st.endnote_format), (Some(NotePos::SectEnd), Some(2), NumFormat::UpperLetter));
+}
+
+/// A Word 6.0/95 `PICF` as Word 95 writes it: 58 bytes, `mm` 8 (a metafile follows), the goal
+/// size and scale, and the crops (twips: left, top, right, bottom); then `body`.
+fn picf6(goal: (i16, i16), scale: (u16, u16), crop: [i16; 4], body: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 58];
+    put32(&mut p, 0, (58 + body.len()) as u32);
+    put16(&mut p, 4, 58);
+    put16(&mut p, 6, 8);
+    for (k, v) in [goal.0 as u16, goal.1 as u16, scale.0, scale.1].into_iter().chain(crop.map(|c| c as u16)).enumerate() {
+        put16(&mut p, 28 + 2 * k, v);
+    }
+    p.extend_from_slice(body);
+    p
+}
+
+#[test]
+fn a_metafile_spelling_a_bitmap_signature_stays_a_metafile_and_a_negative_crop_adds_to_the_size() {
+    // The WMF of `inline_pictures_are_read` with its SetWindowExt height 0x4D42: "BM" at offset
+    // 24, which the raster check took for a bitmap there and kept ten bytes of. Cropped -200 on
+    // the left (the picture extends outward) and 100 on the right of a 1000-twip goal at 100 %:
+    // 1100 twips, 55 pt, wide; the model's crop keeps only the right one.
+    let wmf: &[u8] = &[1, 0, 9, 0, 0, 3, 17, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0x0C, 0x02, 0x42, 0x4D, 0xE8, 0x03, 3, 0, 0, 0, 0, 0];
+    let mut text = b"A\x01\r\0".to_vec();
+    let first = TEXT_AT + text.len() as u32;
+    text.extend(picf6((1000, 600), (1000, 1000), [-200, 0, 100, 0], wmf));
+    let a = [&[0x75, 1, 0x44, 4][..], &first.to_le_bytes()].concat();
+    let runs: &[(u32, u32, &[u8])] = &[(0, 1, &[]), (1, 2, &a), (2, 3, &[])];
+    let doc = read(&word6_file(&Doc6 { text: &text, ccp: Some(3), runs, ..Default::default() })).expect("opens");
+    let [craft_wordmodel::para::InlineObject::Image { media, w, crop, .. }] = first_para(&doc).objects.as_slice() else { panic!("one image") };
+    assert_eq!(media.as_str(), "image1.wmf");
+    assert_eq!(doc.media.get("image1.wmf").map(|m| m.as_slice()), Some(wmf));
+    assert!((*w - 55.0).abs() < 1e-3, "{w}");
+    assert_eq!(*crop, [0.0, 0.0, 0.1, 0.0]);
+}
+
+#[test]
+fn inline_pictures_are_read() {
+    // A WMF: the 9-word header (size 17 words), a SetWindowExt record and the EOF record.
+    let wmf: &[u8] = &[1, 0, 9, 0, 0, 3, 17, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0x0C, 0x02, 0x58, 0x02, 0xE8, 0x03, 3, 0, 0, 0, 0, 0];
+    // The case Word 95 wrote from RTF: goal 1000 x 600 twips, cropped 100/50/200/150, scaled
+    // 50 % x 200 %. Word 2016 shows it 17.5 x 40 pt, cropped 0.1/0.083/0.2/0.25. The bytes after
+    // the metafile are not part of it.
+    let mut text = b"A\x01B\x01C\x01D\r\0".to_vec();
+    let first = TEXT_AT + text.len() as u32;
+    text.extend(picf6((1000, 600), (500, 2000), [100, 50, 200, 150], &[wmf, &[0xAB; 6]].concat()));
+    // Not a metafile: no picture.
+    let second = TEXT_AT + text.len() as u32;
+    text.extend(picf6((1000, 600), (1000, 1000), [0; 4], &[0x42; 40]));
+    let at = |fc: u32| [&[0x75, 1, 0x44, 4][..], &fc.to_le_bytes()].concat();
+    let (a, b, c) = (at(first), at(second), at(0));
+    let runs: &[(u32, u32, &[u8])] = &[(0, 1, &[]), (1, 2, &a), (2, 3, &[]), (3, 4, &b), (4, 5, &[]), (5, 6, &c), (6, 8, &[])];
+    let doc = read(&word6_file(&Doc6 { text: &text, ccp: Some(8), runs, ..Default::default() })).expect("opens");
+    let p = first_para(&doc);
+    assert_eq!(p.text, "A\u{FFFC}BCD");
+    let [craft_wordmodel::para::InlineObject::Image { media, w, h, crop, .. }] = p.objects.as_slice() else { panic!("one image: {:?}", p.objects) };
+    assert_eq!((*w, *h), (17.5, 40.0));
+    assert_eq!(*crop, [0.1, 50.0 / 600.0, 0.2, 0.25]);
+    assert_eq!(media.as_str(), "image1.wmf");
+    assert_eq!(doc.media.get("image1.wmf").map(|m| m.as_slice()), Some(wmf));
+}
+
+#[test]
+fn bookmarks_are_read() {
+    // As Word 95 wrote the sample's nested pair, then a hidden one: the names as a u16 byte count
+    // and length-prefixed 8-bit names, the starts with their FBKFs (ibkl, bkc), the ends in end
+    // order. Word 2016 reads Outer as "one two three" and Inner as "two".
+    let mut sttb = vec![0, 0];
+    for n in ["Outer", "Inner", "_Hlt1"] {
+        sttb.push(n.len() as u8);
+        sttb.extend_from_slice(n.as_bytes());
+    }
+    let size = sttb.len() as u16;
+    put16(&mut sttb, 0, size);
+    let cps = |cps: &[u32], data: &[u8]| [cps.iter().flat_map(|c| c.to_le_bytes()).collect::<Vec<u8>>(), data.to_vec()].concat();
+    let bkf = cps(&[0, 4, 14, 20], &[1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0]);
+    let bkl = cps(&[7, 13, 18, 20], &[]);
+    let raw_pairs: &[(usize, &[u8])] = &[(21, &sttb), (22, &bkf), (23, &bkl)];
+    let doc = read(&word6_file(&Doc6 { text: b"one two three last\r", raw_pairs, ..Default::default() })).expect("opens");
+    assert_eq!(super::with_bookmarks(first_para(&doc)), "[Outer[one [Inner[two]Inner] three]Outer] [_Hlt1[last]_Hlt1]");
+}
+
+/// A Word 6 `ANLD` sprm (0x0C): `nfc`, the text before and after, the flag byte (bit 2 `fPrev`,
+/// bit 3 `fHang`) and the start, with no font of its own and a 360-twip indent.
+fn anld(nfc: u8, before: &[u8], after: &[u8], flags: u8, start: u16) -> Vec<u8> {
+    let mut v = vec![0x0C, 52];
+    v.extend_from_slice(&anlv(nfc, before, after, flags, start));
+    v.extend_from_slice(&[0; 4]);
+    let mut text = [before, after].concat();
+    text.resize(32, 0);
+    v.extend_from_slice(&text);
+    v
+}
+
+/// An `ANLV`: nfc, the counts of text before and after, the flags, then font 0x8001 (none), size,
+/// start, indent 360 and space.
+fn anlv(nfc: u8, before: &[u8], after: &[u8], flags: u8, start: u16) -> Vec<u8> {
+    let mut v = vec![nfc, before.len() as u8, after.len() as u8, flags, 0, 0, 0x01, 0x80, 0, 0];
+    v.extend_from_slice(&start.to_le_bytes());
+    v.extend_from_slice(&360i16.to_le_bytes());
+    v.extend_from_slice(&[0, 0]);
+    v
+}
+
+/// Each main-text paragraph's list label, as the model counts them, and its text.
+fn labels(doc: &craft_wordmodel::Document) -> Vec<String> {
+    let mut counters = craft_wordmodel::numbering::Counters::default();
+    let paras: Vec<_> = doc.body.iter().filter_map(|b| b.as_para()).collect();
+    paras
+        .iter()
+        .map(|p| {
+            let label =
+                p.props.numbering.as_ref().and_then(|n| counters.next_label(&doc.numbering, n.num, n.level)).map(|(l, _)| l).unwrap_or_default();
+            format!("{label} {}", p.text)
+        })
+        .collect()
+}
+
+#[test]
+fn numbered_and_bulleted_paragraphs_count_as_word_95_does() {
+    // As Word 95 wrote them, nLvlAnm (0x0D) then the ANLD, here through the paragraphs' styles: a
+    // bullet and a skipped paragraph don't break the count, nor does another start; a plain
+    // paragraph and other text after the number do. Word 95 shows 1. 2. • 3. - 4. - 1. 1).
+    let dec = [&[0x0D, 10][..], &anld(0, b"", b".", 0x08, 1)].concat();
+    // The bullet in Symbol (font 1), as Word 95 wrote `\pnf1`: its 0xB7 is that font's bullet.
+    let mut bullet = [&[0x0D, 11][..], &anld(0xFF, &[0xB7], b"", 0x08, 0)].concat();
+    bullet[10..12].copy_from_slice(&1u16.to_le_bytes());
+    let start7 = [&[0x0D, 10][..], &anld(0, b"", b".", 0x08, 7)].concat();
+    let paren = [&[0x0D, 10][..], &anld(0, b"", b")", 0x08, 1)].concat();
+    let style = |name, papx| Some(Std { sti: 0x0FFE, sgc: 1, base: 0, name, papx, chpx: &[] });
+    let styles = &[
+        Some(Std { sgc: 1, base: 0x0FFF, name: "Normal", ..Default::default() }),
+        style("Decimal", &dec),
+        style("Bullet", &bullet),
+        style("Start 7", &start7),
+        style("Paren", &paren),
+    ];
+    let paras: &[(u32, u32, &[u8])] =
+        &[(0, 2, &[]), (2, 4, &[]), (4, 6, &[]), (6, 8, &[]), (8, 10, &[0x0D, 12]), (10, 12, &[]), (12, 14, &[]), (14, 16, &[]), (16, 18, &[])];
+    let para_styles = &[1, 1, 2, 1, 1, 3, 0, 1, 4];
+    let fonts: &[(u8, &str)] = &[(0, "Times New Roman"), (2, "Symbol")];
+    let doc =
+        read(&word6_file(&Doc6 { text: b"a\rb\rx\rc\rs\rd\rp\re\rf\r", paras, para_styles, styles, fonts, ..Default::default() })).expect("opens");
+    assert_eq!(labels(&doc), ["1. a", "2. b", "\u{2022} x", "3. c", " s", "4. d", " p", "1. e", "1) f"]);
+}
+
+#[test]
+fn headings_without_an_olst_show_the_levels_above_in_their_own_formats() {
+    // No OLST: each heading's own ANLD sets its level, upper roman at level 1, decimal with
+    // fPrev at level 2. The level-2 heading shows the level above in its own format, I.1., not
+    // the default decimal's 1.1.
+    let h1 = [&[0x0D, 1][..], &anld(1, b"", b".", 0x08, 1)].concat();
+    let h2 = [&[0x0D, 2][..], &anld(0, b"", b".", 0x0C, 1)].concat();
+    let paras: &[(u32, u32, &[u8])] = &[(0, 2, &h1), (2, 4, &h2)];
+    let doc = read(&word6_file(&Doc6 { text: b"a\rb\r", paras, ..Default::default() })).expect("opens");
+    assert_eq!(labels(&doc), ["I. a", "I.1. b"]);
+}
+
+#[test]
+fn numbering_a_fast_save_records_in_a_prc_counts() {
+    // A fast save numbered the second paragraph: the change is only in the Prc (a Prm1) of the
+    // piece holding its mark, applied after its PAPX.
+    let dec = [&[0x0D, 10][..], &anld(0, b"", b".", 0x08, 1)].concat();
+    let prcs: &[&[u8]] = &[&dec];
+    let d = Doc6 { text: b"a\rb\r", pieces: Some(&[(2, 0), (2, 2)]), prms: &[0, 0x0001], prcs, ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    assert_eq!(labels(&doc), [" a", "1. b"]);
+}
+
+#[test]
+fn headings_take_their_levels_from_the_sections_olst() {
+    // A section's OLST (0x85: nine ANLVs, 4 bytes, then the levels' texts in turn) numbers I. A.
+    // and, with fPrev, I.A.1.; the headings carry nLvlAnm 1-3, the first ones through their
+    // style alone. Word 95 shows I. A. I.A.1. I.A.2. II. A.
+    let mut olst = vec![0x85, 212];
+    for (nfc, flags) in [(1u8, 0x08u8), (3, 0x08), (0, 0x0C)] {
+        olst.extend_from_slice(&anlv(nfc, b"", b".", flags, 1));
+    }
+    olst.resize(2 + 9 * 16 + 4, 0);
+    olst.extend_from_slice(b"...");
+    olst.resize(2 + 212, 0);
+    let styles = &[
+        Some(Std { sgc: 1, base: 0x0FFF, name: "Normal", ..Default::default() }),
+        Some(Std { sti: 1, sgc: 1, base: 0, name: "heading 1", papx: &[0x0D, 1], chpx: &[] }),
+    ];
+    let paras: &[(u32, u32, &[u8])] = &[(0, 2, &[]), (2, 4, &[0x0D, 2]), (4, 6, &[0x0D, 3]), (6, 8, &[0x0D, 3]), (8, 10, &[]), (10, 12, &[0x0D, 2])];
+    let d = Doc6 { text: b"a\rb\rc\rd\re\rf\r", paras, para_styles: &[1, 0, 0, 0, 1, 0], styles, sections: &[(12, &olst)], ..Default::default() };
+    let doc = read(&word6_file(&d)).expect("opens");
+    assert_eq!(labels(&doc), ["I. a", "A. b", "I.A.1. c", "I.A.2. d", "II. e", "A. f"]);
 }
