@@ -279,11 +279,6 @@ pub(crate) fn match_tcvn3_single(c: char) -> Option<char> {
     if (0x80..=0xFF).contains(&code) { TCVN3_LOWER_MAP[(code - 0x80) as usize] } else { None }
 }
 
-/// Check whether an ASCII string or %-escaped CAD control represents uppercase TCVN3 text.
-pub(crate) fn is_tcvn3_all_caps(s: &str) -> bool {
-    is_tcvn3_bytes_all_caps(s.as_bytes())
-}
-
 /// Check whether a raw byte slice (ignoring AutoCAD `%%` control escapes) contains uppercase ASCII letters
 /// and no lowercase ASCII letters.
 pub(crate) fn is_tcvn3_bytes_all_caps(bytes: &[u8]) -> bool {
@@ -291,23 +286,28 @@ pub(crate) fn is_tcvn3_bytes_all_caps(bytes: &[u8]) -> bool {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && bytes.get(i + 1) == Some(&b'%') {
-            i += 2;
-            if let Some(&next) = bytes.get(i) {
-                if next.is_ascii_alphabetic() {
-                    i += 1;
+            // Why: In AutoCAD DXF/MTEXT, `%%%` is an escaped literal `%`
+            // (so `A%%%%%d` = `A` + `%%%` + `%%d` degree symbol, keeping `d`
+            // inside a control code rather than exposing it as lowercase text).
+            if bytes.get(i + 2) == Some(&b'%') {
+                i += 3;
+                continue;
+            }
+            if let Some(&code) = bytes.get(i + 2) {
+                // Documented AutoCAD single-character inline control codes.
+                if matches!(code, b'c' | b'C' | b'd' | b'D' | b'p' | b'P' | b'u' | b'U' | b'o' | b'O' | b'k' | b'K') {
+                    i += 3;
                     continue;
                 }
-                if next.is_ascii_digit() {
-                    for _ in 0..3 {
-                        if bytes.get(i).is_some_and(u8::is_ascii_digit) {
-                            i += 1;
-                        } else {
-                            break;
-                        }
-                    }
+                // AutoCAD 3-digit character code (`%%nnn`).
+                if code.is_ascii_digit() && bytes.get(i + 3).is_some_and(u8::is_ascii_digit) && bytes.get(i + 4).is_some_and(u8::is_ascii_digit) {
+                    i += 5;
                     continue;
                 }
             }
+            // Why: Unknown `%%x` sequences are not control codes; skip only `%%`
+            // so `x` remains visible to the lowercase check.
+            i += 2;
             continue;
         }
         let b = bytes[i];
@@ -468,22 +468,112 @@ pub fn decode_tcvn3(input: &[u8], is_upper: bool, mode: DecodeMode) -> Result<Co
     Ok(Cow::Owned(out))
 }
 
+/// Returns `true` when a Latin-1 widened string contains any of the 41 TCVN3
+/// codepoints in `0xA8..=0xFE` whose Unicode Latin-1 equivalents are NOT valid
+/// Vietnamese letters (`«`, `¬`, `×`, `Ø`, `Ð`, `Þ`, `ß`, `Ç`, `Ü`, `þ`, etc.).
+pub(super) fn has_unambiguous_tcvn3_latin1_markers(s: &str) -> bool {
+    s.chars().any(|c| {
+        matches!(
+            u32::from(c),
+            0xA8..=0xAE
+                | 0xB5..=0xB9
+                | 0xBB..=0xBE
+                | 0xC6..=0xC7
+                | 0xCB
+                | 0xCE..=0xD1
+                | 0xD6..=0xD8
+                | 0xDC
+                | 0xDE..=0xDF
+                | 0xE4..=0xE7
+                | 0xEB
+                | 0xEE..=0xF1
+                | 0xF6..=0xF8
+                | 0xFB..=0xFC
+                | 0xFE
+        )
+    })
+}
+
+/// Checks whether a standalone Latin-1 word under a lowercase `.VnTime` hint
+/// violates Vietnamese phonotactics as Unicode while decoding to valid TCVN3:
+/// 1. Mid-word uppercase Latin-1 vowel after lowercase ASCII (`"bÊn"`, `"tÝnh"`, `"vÒ"`).
+/// 2. Word-initial `{È, É, Ê, Ì, Ò, Ô, Õ, Ý}` closed by `-p/-t/-c/-ch` (`"Ých"`, `"Ýt"`, `"Êt"`, `"Õp"`),
+///    which violates Vietnamese checked-syllable tone constraints in Unicode.
+/// 3. Word-final open `'â'` (`0xE2` -> `'õ'`, e.g. `"gâ"`, `"râ"`, `"ngâ"`), since `'â'` cannot end
+///    an open syllable in Vietnamese.
+fn is_false_unicode_tcvn3_token(token: &str) -> bool {
+    let trimmed = token.trim_matches(|c: char| c.is_ascii_punctuation());
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Rule 2a: Lowercase ASCII followed immediately by an uppercase Latin-1 vowel
+    // (e.g. "bÊn" -> "bến", "tÝnh" -> "tính", "vÒ" -> "về").
+    let mut prev_is_ascii_lower = false;
+    for c in trimmed.chars() {
+        let code = u32::from(c);
+        let is_upper_latin1_vowel = matches!(code, 0xC8..=0xCA | 0xCC | 0xD2..=0xD5 | 0xDD);
+        if prev_is_ascii_lower && is_upper_latin1_vowel {
+            return true;
+        }
+        prev_is_ascii_lower = c.is_ascii_lowercase();
+    }
+
+    // Rule 2b: Checked-syllable tone violation on word-initial uppercase Latin-1 vowel
+    // (È, É, Ê, Ì, Ò, Ô, Õ, Ý cannot take -p, -t, -c, -ch codas in Unicode Vietnamese).
+    let mut chars = trimmed.chars();
+    if let Some(first) = chars.next() {
+        let rest = chars.as_str();
+        let is_non_checked_upper_vowel = matches!(u32::from(first), 0xC8..=0xCA | 0xCC | 0xD2 | 0xD4..=0xD5 | 0xDD);
+        if is_non_checked_upper_vowel
+            && !rest.is_empty()
+            && rest.chars().all(|c| c.is_ascii_alphabetic())
+            && (rest.eq_ignore_ascii_case("p") || rest.eq_ignore_ascii_case("t") || rest.eq_ignore_ascii_case("c") || rest.eq_ignore_ascii_case("ch"))
+        {
+            return true;
+        }
+    }
+
+    // Rule 3b: Open syllable ending in 'â' (0xE2 -> 'õ' in TCVN3, e.g. "gâ" -> "gõ", "ngâ" -> "ngõ").
+    if let Some(onset) = trimmed.strip_suffix('\u{00E2}')
+        && !onset.is_empty()
+        && onset.chars().all(|c| c.is_ascii_alphabetic())
+    {
+        return true;
+    }
+
+    false
+}
+
+/// Returns `true` when an explicit `Tcvn3` / `Tcvn3H` font hint should bypass
+/// `is_already_unicode_vietnamese` for a Latin-1 representable string.
+pub(super) fn should_bypass_unicode_guard_for_tcvn3(s: &str, is_uppercase_font: bool) -> bool {
+    if !s.chars().all(|c| u32::from(c) <= 0xFF) {
+        return false;
+    }
+    if has_unambiguous_tcvn3_latin1_markers(s) {
+        return true;
+    }
+    !is_uppercase_font && s.split_whitespace().any(is_false_unicode_tcvn3_token)
+}
+
 /// Transcode a TCVN3 (ABC) standard string to Unicode NFC.
 pub fn transcode_tcvn3(s: &str) -> Cow<'_, str> {
-    if s.is_ascii() || is_already_unicode_vietnamese(s) {
+    if s.is_ascii() {
+        return Cow::Borrowed(s);
+    }
+    // Why: Bypass the Unicode heuristic when a `.VnTime` hint accompanies
+    // unambiguous TCVN3 markers (e.g. `"kh«ng Ýt h¬n"` -> `"không ít hơn"`)
+    // or narrow ambiguous Latin-1 words like `"Ých"` -> `"ích"`.
+    if !should_bypass_unicode_guard_for_tcvn3(s, false) && is_already_unicode_vietnamese(s) {
+        return Cow::Borrowed(s);
+    }
+    if !s.chars().all(|c| u32::from(c) <= 0xFF) {
         return Cow::Borrowed(s);
     }
 
-    let all_caps = is_tcvn3_all_caps(s);
-    let mut bytes = Vec::with_capacity(s.len());
-    for c in s.chars() {
-        let code = c as u32;
-        if code > 0xFF {
-            return Cow::Borrowed(s);
-        }
-        bytes.push(code as u8);
-    }
-
+    let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
+    let all_caps = is_tcvn3_bytes_all_caps(&bytes);
     match decode_tcvn3(&bytes, all_caps, DecodeMode::Practical) {
         Ok(decoded) => {
             let nfc = super::normalize_nfc(&decoded);
@@ -493,7 +583,13 @@ pub fn transcode_tcvn3(s: &str) -> Cow<'_, str> {
     }
 }
 
-/// Transcode a TCVN3H all-uppercase string to Unicode NFC uppercase.
+/// Transcodes a Latin-1 widened string using the uppercase TCVN3H (`.VnTimeH`) mapping.
+///
+/// Vietnamese letters and ASCII `a..=z` are mapped to uppercase, whereas
+/// CP1252 fallback characters in `0x80..=0x9F` (such as `š` or `œ`) preserve
+/// their original case. Returns `Cow::Borrowed(s)` without allocating when
+/// `s` is already uppercase ASCII, non-Latin-1, or recognized as Unicode
+/// Vietnamese without TCVN3 markers.
 pub fn transcode_tcvn3_h(s: &str) -> Cow<'_, str> {
     if s.is_ascii() {
         if !s.bytes().any(|b| b.is_ascii_lowercase()) {
@@ -501,14 +597,18 @@ pub fn transcode_tcvn3_h(s: &str) -> Cow<'_, str> {
         }
         return Cow::Owned(s.to_ascii_uppercase());
     }
+    // Why: Check Latin-1 representability before allocating `bytes` so strings
+    // with non-Latin-1 characters (e.g. `"Plan 🙂"`) stay zero-allocation.
+    if !s.chars().all(|c| u32::from(c) <= 0xFF) {
+        return Cow::Borrowed(s);
+    }
+    if !should_bypass_unicode_guard_for_tcvn3(s, true) && is_already_unicode_vietnamese(s) {
+        return Cow::Borrowed(s);
+    }
 
     let mut bytes = Vec::with_capacity(s.len());
     for c in s.chars() {
-        let code = c as u32;
-        if code > 0xFF {
-            return Cow::Borrowed(s);
-        }
-        bytes.push(code as u8);
+        bytes.push(c as u8);
     }
 
     match decode_tcvn3(&bytes, true, DecodeMode::Practical) {

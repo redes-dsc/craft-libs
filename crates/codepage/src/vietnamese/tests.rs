@@ -1070,3 +1070,33 @@ fn test_minor_edge_cases_and_tcvn3_cad_escapes() {
     let tcvn3h_meta = EncodingMetadata { font_name: Some(".VnTimeH"), codepage_hint: None };
     assert_eq!(detect_encoding(vni_bytes, Some(&tcvn3h_meta)), DetectionResult::Ambiguous(&[LegacyEncoding::Tcvn3H, LegacyEncoding::Vni]));
 }
+
+#[test]
+fn test_tcvn3_latin1_widened_overlap_and_final_coderabbit_cases() {
+    // 41 unambiguous TCVN3 markers bypass the Unicode guard even next to ambiguous vowels like Ý.
+    assert_eq!(transcode_vietnamese("kh«ng Ýt h¬n", Some(".VnTime")), "không ít hơn");
+    assert_eq!(transcode_vietnamese("KH«NG ÝT H¬N", Some(".VnTimeH")), "KHÔNG ÍT HƠN");
+
+    // Token-level phonotactic rules decode false-Unicode TCVN3 words; genuine Unicode stays intact.
+    assert_eq!(transcode_vietnamese("Ých", Some(".VnTime")), "ích");
+    assert_eq!(transcode_vietnamese("bÕn Ýt", Some(".VnTime")), "bến ít");
+    assert_eq!(transcode_vietnamese("gâ Ýt", Some(".VnTime")), "gõ ít");
+    assert_eq!(transcode_vietnamese("Ít khi", Some(".VnTime")), "Ít khi");
+    assert_eq!(transcode_vietnamese("Ý kiến", Some(".VnTime")), "Ý kiến");
+
+    // An undecodable VNI coincidence (0xA7 invalid in VNI) must not veto a valid `.VnTimeH` hint.
+    let meta = EncodingMetadata { font_name: Some(".VnTimeH"), codepage_hint: None };
+    let decoded = decode_text(b"Y\xD5N \xA7\xB6O 12345678", &DecodeOptions { metadata: Some(&meta), ..Default::default() })
+        .expect("undecodable VNI coincidence must not override .VnTimeH");
+    assert_eq!(decoded, "YẾN ĐẢO 12345678");
+
+    // AutoCAD `%%%` literal percent + `%%d` keeps all-caps inference; unknown `%%x` leaves `x` visible.
+    assert_eq!(decode_tcvn3(b"A%%%%%d \xD2", false, DecodeMode::Practical).unwrap(), "A%%%%%d Ề");
+    assert_eq!(decode_tcvn3(b"A%%x \xD2", false, DecodeMode::Practical).unwrap(), "A%%x ề");
+
+    // Non-Latin-1 input under `.VnTimeH` stays borrowed.
+    let emoji = "Plan 🙂";
+    let out = super::transcode_tcvn3_h(emoji);
+    assert!(matches!(out, Cow::Borrowed(_)));
+    assert_eq!(out, emoji);
+}

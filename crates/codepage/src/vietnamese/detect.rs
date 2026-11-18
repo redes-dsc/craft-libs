@@ -377,11 +377,20 @@ pub fn detect_encoding(input: &[u8], metadata: Option<&EncodingMetadata<'_>>) ->
             if input.len() >= 16 && std::str::from_utf8(input).is_err() {
                 let latin1_s: String = input.iter().map(|&b| b as char).collect();
                 let (vni_valid, tcvn_valid, _, _) = score_vietnamese_encodings(&latin1_s);
-                if enc == LegacyEncoding::Tcvn3 && vni_valid && !tcvn_valid {
-                    return DetectionResult::Ambiguous(&[LegacyEncoding::Tcvn3, LegacyEncoding::Vni]);
-                }
-                if enc == LegacyEncoding::Tcvn3H && vni_valid && !tcvn_valid {
-                    return DetectionResult::Ambiguous(&[LegacyEncoding::Tcvn3H, LegacyEncoding::Vni]);
+                // Why: VNI may veto a TCVN3/TCVN3H hint only when it can decode the whole
+                // payload in Strict mode; otherwise a coincidental pair (e.g. `Y\xD5` in
+                // `b"Y\xD5N \xA7\xB6O ..."`, where 0xA7 is invalid in VNI) would wrongly
+                // override a valid `.VnTimeH` hint.
+                if matches!(enc, LegacyEncoding::Tcvn3 | LegacyEncoding::Tcvn3H)
+                    && vni_valid
+                    && !tcvn_valid
+                    && super::vni::decode_vni(input, super::DecodeMode::Strict).is_ok()
+                {
+                    return DetectionResult::Ambiguous(if enc == LegacyEncoding::Tcvn3H {
+                        &[LegacyEncoding::Tcvn3H, LegacyEncoding::Vni]
+                    } else {
+                        &[LegacyEncoding::Tcvn3, LegacyEncoding::Vni]
+                    });
                 }
                 if enc == LegacyEncoding::Vni && tcvn_valid && !vni_valid {
                     return DetectionResult::Ambiguous(&[LegacyEncoding::Vni, LegacyEncoding::Tcvn3]);

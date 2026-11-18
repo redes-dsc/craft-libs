@@ -4,7 +4,7 @@
 //! cross-verified with UniKey core engine (`vnconv` / `vni.tab`) by Phạm Kim Long and
 //! CPAN `Encode::VN::VNI`.
 //! All decoded outputs deterministically emit standard precomposed Unicode NFC (TCVN 6909:2001).
-//! Pass-through inputs that are not decoded (for example, already-Unicode strings passed to
+//! Pass-through inputs that are not decoded (for example, strings recognized by the Unicode heuristic passed to
 //! [`transcode_vni`]) are returned as `Cow::Borrowed` without forcing NFC normalization.
 
 use std::borrow::Cow;
@@ -732,7 +732,7 @@ pub fn decode_vni(input: &[u8], mode: DecodeMode) -> Result<Cow<'_, str>, Decode
 
 /// Transcode a VNI Windows string to Unicode NFC.
 ///
-/// Pass-through strings that are not decoded (ASCII, already-Unicode, or non-Latin-1 inputs)
+/// Pass-through strings that are not decoded (ASCII, inputs recognized by the Unicode heuristic, or non-Latin-1 inputs)
 /// are returned as `Cow::Borrowed` without forcing NFC normalization.
 pub fn transcode_vni(s: &str) -> Cow<'_, str> {
     if s.is_ascii() || is_already_unicode_vietnamese(s) {

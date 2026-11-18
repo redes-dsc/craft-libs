@@ -181,7 +181,12 @@ fn transcode_str_inner<'a>(s: &'a str, font_hint: Option<&str>) -> TranscodeResu
         return TranscodeResult { text: Cow::Borrowed(s), encoding: None, was_transcoded: false };
     };
 
-    if (s.is_ascii() && encoding != LegacyEncoding::Tcvn3H) || is_already_unicode_vietnamese(s) {
+    let bypass_unicode_guard = match encoding {
+        LegacyEncoding::Tcvn3 => tcvn3::should_bypass_unicode_guard_for_tcvn3(s, false),
+        LegacyEncoding::Tcvn3H => tcvn3::should_bypass_unicode_guard_for_tcvn3(s, true),
+        LegacyEncoding::Vni | LegacyEncoding::Windows1258 => false,
+    };
+    if (s.is_ascii() && encoding != LegacyEncoding::Tcvn3H) || (!bypass_unicode_guard && is_already_unicode_vietnamese(s)) {
         return TranscodeResult { text: Cow::Borrowed(s), encoding: Some(encoding), was_transcoded: false };
     }
 
@@ -198,10 +203,12 @@ fn transcode_str_inner<'a>(s: &'a str, font_hint: Option<&str>) -> TranscodeResu
 
 /// Transcode legacy 8-bit Vietnamese text to Unicode NFC using an optional font hint or detection heuristics.
 ///
-/// If `font_hint` matches a recognized legacy font family (e.g. `.VnTime`, `VNI-Times`),
-/// that encoding is applied directly. Otherwise, conservative heuristic detection is attempted.
-/// Returns `Cow::Borrowed(s)` with zero allocations if the text is pure ASCII, already Unicode,
-/// or not identified as legacy Vietnamese.
+/// `font_hint` is advisory evidence: if `s` is already recognized as Unicode Vietnamese (without
+/// unambiguous legacy markers), `s` is preserved unchanged; callers that know the exact source
+/// encoding should call [`transcode_explicit`] instead.
+///
+/// Returns `Cow::Borrowed(s)` with zero allocations when `s` is unchanged (including pure ASCII
+/// for non-`Tcvn3H` hints; a `Tcvn3H` hint allocates `Cow::Owned` when uppercasing lowercase ASCII).
 pub fn transcode_vietnamese<'a>(s: &'a str, font_hint: Option<&str>) -> Cow<'a, str> {
     transcode_str_inner(s, font_hint).text
 }
