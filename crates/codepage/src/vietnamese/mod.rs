@@ -328,6 +328,10 @@ fn apply_nfc_cow_for<'a>(cow: Cow<'a, str>, enc: LegacyEncoding) -> Cow<'a, str>
 
 /// Transcode using an explicitly known encoding, skipping heuristic detection.
 ///
+/// The output is normalized to Unicode NFC with the same policy as [`decode_text`]:
+/// `Windows1258` uses the full UAX #15 pipeline in [`normalize_cp1258_nfc`], other
+/// encodings use [`normalize_nfc`].
+///
 /// Use this in `pdfcraft` or strict pipelines when metadata (such as a known PDF font name)
 /// guarantees the encoding, eliminating heuristic detection false positives.
 pub fn transcode_explicit<'a>(text: &'a str, encoding: LegacyEncoding) -> Cow<'a, str> {
@@ -342,7 +346,11 @@ pub fn transcode_explicit<'a>(text: &'a str, encoding: LegacyEncoding) -> Cow<'a
 
     match decode_with_mode(&bytes, encoding, DecodeMode::Practical) {
         Ok(decoded) => {
-            let nfc = normalize_nfc(&decoded);
+            // Why: normalizing must depend on the encoding, not on the entry point.
+            // Windows-1258 needs the full UAX #15 pipeline (decompose + CCC order +
+            // starter-retaining recomposition), exactly as `decode_text` and
+            // `transcode_windows1258` do, so `É` + `U+0323` here also yields `Ẹ\u{0301}`.
+            let nfc = apply_nfc_cow_for(decoded, encoding);
             if nfc.as_ref() == text { Cow::Borrowed(text) } else { Cow::Owned(nfc.into_owned()) }
         }
         Err(_) => Cow::Borrowed(text),

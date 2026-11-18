@@ -1185,6 +1185,26 @@ fn test_regression_invariants_for_vietnamese_transcoding_and_nfc() {
     assert_eq!(transcode_vietnamese("Á CHÂU ®· Cã", Some(".VnTimeH")), "Á CHÂU ĐÃ CÓ");
     assert_eq!(transcode_vietnamese("nÒn", Some(".VnTime")), "nền");
     assert_eq!(transcode_vietnamese("tÔi", Some(".VnTime")), "tÔi");
+
+    // 9. Why: every Windows-1258 entry point must agree on NFC. `transcode_explicit`
+    // receives the Latin-1 widened form of bytes `C9 F2` and `43 EC F2`, so it must run
+    // the same UAX #15 pipeline as `decode_text` and return `"Ẹ\u{0301}"` and
+    // `"Ć\u{0323}"` instead of a partially composed `É\u{0323}` / `C\u{0323}\u{0301}`.
+    assert_eq!(transcode_explicit("\u{00C9}\u{00F2}", LegacyEncoding::Windows1258), "Ẹ\u{0301}");
+    assert_eq!(transcode_explicit("\u{0043}\u{00EC}\u{00F2}", LegacyEncoding::Windows1258), "Ć\u{0323}");
+    assert_eq!(
+        transcode_explicit("\u{00C9}\u{00F2}", LegacyEncoding::Windows1258),
+        decode_text(&[0xC9, 0xF2], &DecodeOptions { force_encoding: Some(LegacyEncoding::Windows1258), normalize_nfc: true, ..Default::default() })
+            .expect("CP1258 Ẹ + acute")
+    );
+    assert_eq!(
+        transcode_explicit("\u{0043}\u{00EC}\u{00F2}", LegacyEncoding::Windows1258),
+        decode_text(
+            &[0x43, 0xEC, 0xF2],
+            &DecodeOptions { force_encoding: Some(LegacyEncoding::Windows1258), normalize_nfc: true, ..Default::default() }
+        )
+        .expect("CP1258 Ć + dot below")
+    );
 }
 
 #[test]

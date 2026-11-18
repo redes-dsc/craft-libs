@@ -7,7 +7,7 @@
 //! `decode_windows1258` is a pure decoding primitive: it maps 8-bit bytes strictly to
 //! Unicode codepoints (including base vowels and the 5 combining diacritical marks:
 //! `U+0300`, `U+0301`, `U+0309`, `U+0303`, `U+0323`) without performing implicit Unicode Normalization
-//! Form C (NFC) composition. Canonical normalization is deferred to [`super::normalize_nfc`].
+//! Form C (NFC) composition. Canonical normalization is deferred to [`super::normalize_cp1258_nfc`].
 
 use std::borrow::Cow;
 
@@ -158,8 +158,8 @@ mod tests {
         // Assert pure decoded output has combining acute and combining dot
         assert_eq!(res.as_ref(), "Tiê\u{0301}ng Viê\u{0323}t 100.000\u{20AB}");
 
-        // Normalizing via normalize_nfc produces the canonical composed form
-        let nfc = super::super::normalize_nfc(&res);
+        // Normalizing via the Windows-1258 NFC pipeline produces the canonical composed form
+        let nfc = super::super::normalize_cp1258_nfc(&res);
         assert_eq!(nfc.as_ref(), "Tiếng Việt 100.000₫");
     }
 
