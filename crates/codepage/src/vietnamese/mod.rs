@@ -256,7 +256,7 @@ pub fn decode_text<'a>(input: &'a [u8], options: &DecodeOptions<'a>) -> Result<C
     if let Some(enc) = options.force_encoding {
         let decoded = decode_with_mode(input, enc, options.mode)?;
         if options.normalize_nfc {
-            return Ok(apply_nfc_cow(decoded));
+            return Ok(apply_nfc_cow_for(decoded, enc));
         }
         return Ok(decoded);
     }
@@ -276,7 +276,7 @@ pub fn decode_text<'a>(input: &'a [u8], options: &DecodeOptions<'a>) -> Result<C
     if let Some(enc) = detection.encoding() {
         let decoded = decode_with_mode(input, enc, options.mode)?;
         if options.normalize_nfc {
-            return Ok(apply_nfc_cow(decoded));
+            return Ok(apply_nfc_cow_for(decoded, enc));
         }
         return Ok(decoded);
     }
@@ -291,13 +291,29 @@ pub fn decode_text<'a>(input: &'a [u8], options: &DecodeOptions<'a>) -> Result<C
 
 /// Canonical Unicode Normalization Form C (NFC) helper preserving borrowed Cow where possible.
 #[inline]
-fn apply_nfc_cow<'a>(cow: Cow<'a, str>) -> Cow<'a, str> {
+fn apply_nfc_cow_with<'a>(cow: Cow<'a, str>, normalizer: fn(&str) -> Cow<'_, str>) -> Cow<'a, str> {
     match cow {
-        Cow::Borrowed(b) => normalize_nfc(b),
-        Cow::Owned(o) => match normalize_nfc(&o) {
+        Cow::Borrowed(b) => match normalizer(b) {
+            Cow::Borrowed(_) => Cow::Borrowed(b),
+            Cow::Owned(composed) => Cow::Owned(composed),
+        },
+        Cow::Owned(o) => match normalizer(&o) {
             Cow::Borrowed(_) => Cow::Owned(o),
             Cow::Owned(composed) => Cow::Owned(composed),
         },
+    }
+}
+
+#[inline]
+pub(crate) fn apply_cp1258_nfc_cow<'a>(cow: Cow<'a, str>) -> Cow<'a, str> {
+    apply_nfc_cow_with(cow, normalize_cp1258_nfc)
+}
+
+#[inline]
+fn apply_nfc_cow_for<'a>(cow: Cow<'a, str>, enc: LegacyEncoding) -> Cow<'a, str> {
+    match enc {
+        LegacyEncoding::Windows1258 => apply_cp1258_nfc_cow(cow),
+        _ => apply_nfc_cow_with(cow, normalize_nfc),
     }
 }
 
@@ -539,11 +555,85 @@ pub const fn compose_vietnamese_pair(base: char, mark: char) -> Option<char> {
     })
 }
 
-/// Normalize a Vietnamese string to precomposed Unicode Normalization Form C (NFC)
-/// using zero runtime dependencies.
+/// Zero-dependency canonical pair composition for the full Windows-1258 character repertoire.
 ///
-/// Returns `Cow::Borrowed` with zero allocations when the string is ASCII or already composed.
-pub fn normalize_nfc<'a>(s: &'a str) -> Cow<'a, str> {
+/// Extends [`compose_vietnamese_pair`] with the 48 non-Vietnamese Latin base + CP1258 combining
+/// mark (`U+0300`, `U+0301`, `U+0303`, `U+0323`) pairs that have precomposed Unicode NFC forms
+/// (such as `n + \u{0303} -> ñ` and `ç + \u{0301} -> ḉ`).
+#[inline]
+pub const fn compose_cp1258_pair(base: char, mark: char) -> Option<char> {
+    if let Some(ch) = compose_vietnamese_pair(base, mark) {
+        return Some(ch);
+    }
+    Some(match (base, mark) {
+        // U+0300 COMBINING GRAVE ACCENT
+        ('N', '\u{0300}') => '\u{01F8}', // Ǹ
+        ('n', '\u{0300}') => '\u{01F9}', // ǹ
+        ('W', '\u{0300}') => '\u{1E80}', // Ẁ
+        ('w', '\u{0300}') => '\u{1E81}', // ẁ
+        // U+0301 COMBINING ACUTE ACCENT
+        ('C', '\u{0301}') => '\u{0106}',        // Ć
+        ('c', '\u{0301}') => '\u{0107}',        // ć
+        ('\u{00C7}', '\u{0301}') => '\u{1E08}', // Ḉ
+        ('\u{00E7}', '\u{0301}') => '\u{1E09}', // ḉ
+        ('G', '\u{0301}') => '\u{01F4}',        // Ǵ
+        ('g', '\u{0301}') => '\u{01F5}',        // ǵ
+        ('K', '\u{0301}') => '\u{1E30}',        // Ḱ
+        ('k', '\u{0301}') => '\u{1E31}',        // ḱ
+        ('L', '\u{0301}') => '\u{0139}',        // Ĺ
+        ('l', '\u{0301}') => '\u{013A}',        // ĺ
+        ('M', '\u{0301}') => '\u{1E3E}',        // Ḿ
+        ('m', '\u{0301}') => '\u{1E3F}',        // ḿ
+        ('N', '\u{0301}') => '\u{0143}',        // Ń
+        ('n', '\u{0301}') => '\u{0144}',        // ń
+        ('P', '\u{0301}') => '\u{1E54}',        // Ṕ
+        ('p', '\u{0301}') => '\u{1E55}',        // ṕ
+        ('R', '\u{0301}') => '\u{0154}',        // Ŕ
+        ('r', '\u{0301}') => '\u{0155}',        // ŕ
+        ('S', '\u{0301}') => '\u{015A}',        // Ś
+        ('s', '\u{0301}') => '\u{015B}',        // ś
+        ('W', '\u{0301}') => '\u{1E82}',        // Ẃ
+        ('w', '\u{0301}') => '\u{1E83}',        // ẃ
+        ('Z', '\u{0301}') => '\u{0179}',        // Ź
+        ('z', '\u{0301}') => '\u{017A}',        // ź
+        // U+0303 COMBINING TILDE
+        ('N', '\u{0303}') => '\u{00D1}', // Ñ
+        ('n', '\u{0303}') => '\u{00F1}', // ñ
+        ('V', '\u{0303}') => '\u{1E7C}', // Ṽ
+        ('v', '\u{0303}') => '\u{1E7D}', // ṽ
+        // U+0323 COMBINING DOT BELOW
+        ('B', '\u{0323}') => '\u{1E04}', // Ḅ
+        ('b', '\u{0323}') => '\u{1E05}', // ḅ
+        ('D', '\u{0323}') => '\u{1E0C}', // Ḍ
+        ('d', '\u{0323}') => '\u{1E0D}', // ḍ
+        ('H', '\u{0323}') => '\u{1E24}', // Ḥ
+        ('h', '\u{0323}') => '\u{1E25}', // ḥ
+        ('K', '\u{0323}') => '\u{1E32}', // Ḳ
+        ('k', '\u{0323}') => '\u{1E33}', // ḳ
+        ('L', '\u{0323}') => '\u{1E36}', // Ḷ
+        ('l', '\u{0323}') => '\u{1E37}', // ḷ
+        ('M', '\u{0323}') => '\u{1E42}', // Ṃ
+        ('m', '\u{0323}') => '\u{1E43}', // ṃ
+        ('N', '\u{0323}') => '\u{1E46}', // Ṇ
+        ('n', '\u{0323}') => '\u{1E47}', // ṇ
+        ('R', '\u{0323}') => '\u{1E5A}', // Ṛ
+        ('r', '\u{0323}') => '\u{1E5B}', // ṛ
+        ('S', '\u{0323}') => '\u{1E62}', // Ṣ
+        ('s', '\u{0323}') => '\u{1E63}', // ṣ
+        ('T', '\u{0323}') => '\u{1E6C}', // Ṭ
+        ('t', '\u{0323}') => '\u{1E6D}', // ṭ
+        ('V', '\u{0323}') => '\u{1E7E}', // Ṿ
+        ('v', '\u{0323}') => '\u{1E7F}', // ṿ
+        ('W', '\u{0323}') => '\u{1E88}', // Ẉ
+        ('w', '\u{0323}') => '\u{1E89}', // ẉ
+        ('Z', '\u{0323}') => '\u{1E92}', // Ẓ
+        ('z', '\u{0323}') => '\u{1E93}', // ẓ
+        _ => return None,
+    })
+}
+
+#[inline]
+fn normalize_with<'a>(s: &'a str, composer: fn(char, char) -> Option<char>) -> Cow<'a, str> {
     if s.is_ascii() || !s.chars().any(is_vietnamese_combining_mark) {
         return Cow::Borrowed(s);
     }
@@ -553,7 +643,7 @@ pub fn normalize_nfc<'a>(s: &'a str) -> Cow<'a, str> {
 
     for (idx, c) in s.char_indices() {
         if let Some((prev_idx, prev_ch)) = prev {
-            if let Some(composed) = compose_vietnamese_pair(prev_ch, c) {
+            if let Some(composed) = composer(prev_ch, c) {
                 let _ = out.get_or_insert_with(|| {
                     let mut buf = String::with_capacity(s.len());
                     buf.push_str(&s[..prev_idx]);
@@ -577,4 +667,18 @@ pub fn normalize_nfc<'a>(s: &'a str) -> Cow<'a, str> {
         (Some(buf), None) => Cow::Owned(buf),
         (None, _) => Cow::Borrowed(s),
     }
+}
+
+/// Normalize a Vietnamese string to precomposed Unicode Normalization Form C (NFC)
+/// using zero runtime dependencies.
+///
+/// Returns `Cow::Borrowed` with zero allocations when the string is ASCII or already composed.
+pub fn normalize_nfc<'a>(s: &'a str) -> Cow<'a, str> {
+    normalize_with(s, compose_vietnamese_pair)
+}
+
+/// Normalize a Windows-1258 decoded string to Unicode Normalization Form C (NFC),
+/// composing both Vietnamese vowels and the 48 non-Vietnamese CP1258 consonant+mark pairs.
+pub fn normalize_cp1258_nfc<'a>(s: &'a str) -> Cow<'a, str> {
+    normalize_with(s, compose_cp1258_pair)
 }

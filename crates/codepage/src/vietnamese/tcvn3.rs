@@ -451,7 +451,7 @@ pub fn decode_tcvn3(input: &[u8], is_upper: bool, mode: DecodeMode) -> Result<Co
                     if mode == DecodeMode::Strict && (0x80..=0x9F).contains(&byte) {
                         return Err(DecodeError::UnmappedByte { byte, offset: i, encoding: enc });
                     }
-                    if all_caps && byte >= 0xA0 {
+                    if all_caps && byte >= 0xA1 {
                         out.extend(c.to_uppercase());
                     } else {
                         out.push(c);

@@ -75,7 +75,7 @@ pub fn transcode_windows1258<'a>(s: &'a str) -> Cow<'a, str> {
 
     match decode_windows1258(&bytes) {
         Ok(decoded) => {
-            let nfc = super::normalize_nfc(&decoded);
+            let nfc = super::apply_cp1258_nfc_cow(decoded);
             if nfc.as_ref() == s { Cow::Borrowed(s) } else { Cow::Owned(nfc.into_owned()) }
         }
         Err(_) => Cow::Borrowed(s),
@@ -336,5 +336,16 @@ mod tests {
         // Widened b"TO\xC1N 100.000\xFE" contains "OÁN" alongside 0xFE ('þ' -> '₫').
         let widened: String = b"TO\xC1N 100.000\xFE".iter().map(|&b| b as char).collect();
         assert_eq!(transcode_windows1258(&widened), "TOÁN 100.000₫");
+    }
+
+    #[test]
+    fn cp1258_nfc_composes_non_vietnamese_latin_consonants() {
+        let widened_pena: String = b"Pen\xDEa".iter().map(|&b| b as char).collect();
+        assert_eq!(transcode_windows1258(&widened_pena), "Peña");
+
+        let opts = super::super::DecodeOptions { force_encoding: Some(LegacyEncoding::Windows1258), ..Default::default() };
+        assert_eq!(super::super::decode_text(b"Pen\xDEa", &opts).as_deref(), Ok("Peña"));
+        assert_eq!(super::super::decode_text(b"\xC7\xEC", &opts).as_deref(), Ok("Ḉ"));
+        assert_eq!(super::super::decode_text(b"c\xEC s\xEC n\xCC", &opts).as_deref(), Ok("ć ś ǹ"));
     }
 }
