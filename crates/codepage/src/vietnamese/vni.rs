@@ -3,7 +3,9 @@
 //! Based on de facto industry conventions established by VNI Software Company (c. 1991–1995),
 //! cross-verified with UniKey core engine (`vnconv` / `vni.tab`) by Phạm Kim Long and
 //! CPAN `Encode::VN::VNI`.
-//! All conversions deterministically emit standard precomposed Unicode NFC (TCVN 6909:2001).
+//! All decoded outputs deterministically emit standard precomposed Unicode NFC (TCVN 6909:2001).
+//! Pass-through inputs that are not decoded (for example, already-Unicode strings passed to
+//! [`transcode_vni`]) are returned as `Cow::Borrowed` without forcing NFC normalization.
 
 use std::borrow::Cow;
 
@@ -729,6 +731,9 @@ pub fn decode_vni(input: &[u8], mode: DecodeMode) -> Result<Cow<'_, str>, Decode
 }
 
 /// Transcode a VNI Windows string to Unicode NFC.
+///
+/// Pass-through strings that are not decoded (ASCII, already-Unicode, or non-Latin-1 inputs)
+/// are returned as `Cow::Borrowed` without forcing NFC normalization.
 pub fn transcode_vni(s: &str) -> Cow<'_, str> {
     if s.is_ascii() || is_already_unicode_vietnamese(s) {
         return Cow::Borrowed(s);
@@ -763,5 +768,31 @@ mod tests {
         let mut out = String::new();
         let err = decoder.decode_chunk(b"abcd", &mut out).expect_err("overflowing stream_offset must return Err, not panic");
         assert_eq!(err, DecodeError::MalformedSequence { offset: usize::MAX - 2, encoding: LegacyEncoding::Vni });
+    }
+
+    #[test]
+    fn vni_decoder_strict_errors_match_across_chunk_splits() {
+        fn run_split(bytes: &[u8], split: usize) -> Result<String, DecodeError> {
+            let mut dec = VniDecoder::new(DecodeMode::Strict);
+            let mut out = String::new();
+            let (first, second) = bytes.split_at(split);
+            dec.decode_chunk(first, &mut out)?;
+            dec.decode_chunk(second, &mut out)?;
+            dec.finish(&mut out)?;
+            Ok(out)
+        }
+
+        let cases: &[(&[u8], DecodeError)] = &[
+            (b"Xo\x81", DecodeError::UnmappedByte { byte: 0x81, offset: 2, encoding: LegacyEncoding::Vni }),
+            (b"X\xF8", DecodeError::UnmappedByte { byte: 0xF8, offset: 1, encoding: LegacyEncoding::Vni }),
+            (b"VI\xCF", DecodeError::MalformedSequence { offset: 1, encoding: LegacyEncoding::Vni }),
+        ];
+
+        for &(bytes, expected_err) in cases {
+            assert_eq!(decode_vni(bytes, DecodeMode::Strict), Err(expected_err));
+            for split in 0..=bytes.len() {
+                assert_eq!(run_split(bytes, split), Err(expected_err), "split={split} for {bytes:?}");
+            }
+        }
     }
 }

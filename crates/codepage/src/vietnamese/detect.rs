@@ -44,28 +44,49 @@ const TCVN3_DOTLESS_PREFIXES: &[&str] = &[
     "tcvn",
 ];
 
+#[inline]
+fn starts_with_ignore_ascii_case(haystack: &str, prefix: &str) -> bool {
+    haystack.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+#[inline]
+fn ends_with_ignore_ascii_case(haystack: &str, suffix: &str) -> bool {
+    haystack.len().checked_sub(suffix.len()).and_then(|start| haystack.get(start..)).is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+}
+
+#[inline]
+fn strip_suffix_ignore_ascii_case<'a>(haystack: &'a str, suffix: &str) -> Option<&'a str> {
+    if ends_with_ignore_ascii_case(haystack, suffix) { haystack.get(..haystack.len() - suffix.len()) } else { None }
+}
+
 /// Detect whether a font name indicates a legacy Vietnamese encoding.
 pub fn is_vietnamese_font(font: &str) -> Option<LegacyEncoding> {
-    let lower = font.trim().to_ascii_lowercase();
-    let stem = lower.strip_suffix(".ttf").or_else(|| lower.strip_suffix(".shx")).or_else(|| lower.strip_suffix(".otf")).unwrap_or(&lower).trim();
+    let trimmed = font.trim();
+    let stem = strip_suffix_ignore_ascii_case(trimmed, ".ttf")
+        .or_else(|| strip_suffix_ignore_ascii_case(trimmed, ".shx"))
+        .or_else(|| strip_suffix_ignore_ascii_case(trimmed, ".otf"))
+        .unwrap_or(trimmed)
+        .trim();
 
     if stem.is_empty() {
         return None;
     }
 
-    if VNI_PREFIXES.iter().any(|p| stem.starts_with(p)) {
+    if VNI_PREFIXES.iter().any(|p| starts_with_ignore_ascii_case(stem, p)) {
         return Some(LegacyEncoding::Vni);
     }
 
-    let is_tcvn = (stem.starts_with(".vn") && stem.len() > 3) || stem == "vn" || TCVN3_DOTLESS_PREFIXES.iter().any(|p| stem.starts_with(p));
+    let is_tcvn = (starts_with_ignore_ascii_case(stem, ".vn") && stem.len() > 3)
+        || stem.eq_ignore_ascii_case("vn")
+        || TCVN3_DOTLESS_PREFIXES.iter().any(|p| starts_with_ignore_ascii_case(stem, p));
 
     if is_tcvn {
-        let is_header = stem.ends_with('h')
-            && !stem.ends_with("tech")
-            && !stem.ends_with("math")
-            && !stem.ends_with("graph")
-            && !stem.ends_with("flash")
-            && !stem.ends_with("brush");
+        let is_header = ends_with_ignore_ascii_case(stem, "h")
+            && !ends_with_ignore_ascii_case(stem, "tech")
+            && !ends_with_ignore_ascii_case(stem, "math")
+            && !ends_with_ignore_ascii_case(stem, "graph")
+            && !ends_with_ignore_ascii_case(stem, "flash")
+            && !ends_with_ignore_ascii_case(stem, "brush");
         if is_header { Some(LegacyEncoding::Tcvn3H) } else { Some(LegacyEncoding::Tcvn3) }
     } else {
         None
@@ -325,20 +346,22 @@ pub fn detect_encoding_from_str(s: &str) -> DetectionResult {
 
     let (vni_valid, tcvn_valid, vni_score, tcvn_score) = score_vietnamese_encodings(s);
 
-    if vni_valid && tcvn_valid {
-        let max_score = vni_score.max(tcvn_score);
-        let diff = vni_score.abs_diff(tcvn_score);
-        if max_score > 0 && (diff as u128) * 100 < (max_score as u128) * 30 {
-            return DetectionResult::Ambiguous(&[LegacyEncoding::Vni, LegacyEncoding::Tcvn3]);
+    match (vni_valid, tcvn_valid) {
+        (true, false) => DetectionResult::HighConfidence { encoding: LegacyEncoding::Vni, evidence: EncodingEvidence::Heuristic },
+        (false, true) => DetectionResult::HighConfidence { encoding: LegacyEncoding::Tcvn3, evidence: EncodingEvidence::Heuristic },
+        (false, false) => DetectionResult::Unknown,
+        (true, true) => {
+            let max_score = vni_score.max(tcvn_score);
+            let diff = vni_score.abs_diff(tcvn_score);
+            if max_score > 0 && (diff as u128) * 100 < (max_score as u128) * 30 {
+                return DetectionResult::Ambiguous(&[LegacyEncoding::Vni, LegacyEncoding::Tcvn3]);
+            }
+            if vni_score > tcvn_score {
+                DetectionResult::HighConfidence { encoding: LegacyEncoding::Vni, evidence: EncodingEvidence::Heuristic }
+            } else {
+                DetectionResult::HighConfidence { encoding: LegacyEncoding::Tcvn3, evidence: EncodingEvidence::Heuristic }
+            }
         }
-    }
-
-    if vni_valid && vni_score > tcvn_score {
-        DetectionResult::HighConfidence { encoding: LegacyEncoding::Vni, evidence: EncodingEvidence::Heuristic }
-    } else if tcvn_valid && tcvn_score > vni_score {
-        DetectionResult::HighConfidence { encoding: LegacyEncoding::Tcvn3, evidence: EncodingEvidence::Heuristic }
-    } else {
-        DetectionResult::Unknown
     }
 }
 
@@ -354,8 +377,11 @@ pub fn detect_encoding(input: &[u8], metadata: Option<&EncodingMetadata<'_>>) ->
             if input.len() >= 16 && std::str::from_utf8(input).is_err() {
                 let latin1_s: String = input.iter().map(|&b| b as char).collect();
                 let (vni_valid, tcvn_valid, _, _) = score_vietnamese_encodings(&latin1_s);
-                if matches!(enc, LegacyEncoding::Tcvn3 | LegacyEncoding::Tcvn3H) && vni_valid && !tcvn_valid {
+                if enc == LegacyEncoding::Tcvn3 && vni_valid && !tcvn_valid {
                     return DetectionResult::Ambiguous(&[LegacyEncoding::Tcvn3, LegacyEncoding::Vni]);
+                }
+                if enc == LegacyEncoding::Tcvn3H && vni_valid && !tcvn_valid {
+                    return DetectionResult::Ambiguous(&[LegacyEncoding::Tcvn3H, LegacyEncoding::Vni]);
                 }
                 if enc == LegacyEncoding::Vni && tcvn_valid && !vni_valid {
                     return DetectionResult::Ambiguous(&[LegacyEncoding::Vni, LegacyEncoding::Tcvn3]);

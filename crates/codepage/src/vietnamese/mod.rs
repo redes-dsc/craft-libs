@@ -175,6 +175,27 @@ pub fn transcode_summary(hint: Option<&str>) -> &'static str {
     }
 }
 
+#[inline]
+fn transcode_str_inner<'a>(s: &'a str, font_hint: Option<&str>) -> TranscodeResult<'a> {
+    let Some(encoding) = detect_legacy_encoding(s, font_hint) else {
+        return TranscodeResult { text: Cow::Borrowed(s), encoding: None, was_transcoded: false };
+    };
+
+    if (s.is_ascii() && encoding != LegacyEncoding::Tcvn3H) || is_already_unicode_vietnamese(s) {
+        return TranscodeResult { text: Cow::Borrowed(s), encoding: Some(encoding), was_transcoded: false };
+    }
+
+    let text = match encoding {
+        LegacyEncoding::Tcvn3 => transcode_tcvn3(s),
+        LegacyEncoding::Tcvn3H => transcode_tcvn3_h(s),
+        LegacyEncoding::Vni => transcode_vni(s),
+        LegacyEncoding::Windows1258 => transcode_windows1258(s),
+    };
+
+    let was_transcoded = matches!(&text, Cow::Owned(_)) || (text.as_ref() != s);
+    TranscodeResult { text, encoding: Some(encoding), was_transcoded }
+}
+
 /// Transcode legacy 8-bit Vietnamese text to Unicode NFC using an optional font hint or detection heuristics.
 ///
 /// If `font_hint` matches a recognized legacy font family (e.g. `.VnTime`, `VNI-Times`),
@@ -182,22 +203,7 @@ pub fn transcode_summary(hint: Option<&str>) -> &'static str {
 /// Returns `Cow::Borrowed(s)` with zero allocations if the text is pure ASCII, already Unicode,
 /// or not identified as legacy Vietnamese.
 pub fn transcode_vietnamese<'a>(s: &'a str, font_hint: Option<&str>) -> Cow<'a, str> {
-    let enc = detect_legacy_encoding(s, font_hint);
-
-    let Some(enc) = enc else {
-        return Cow::Borrowed(s);
-    };
-
-    if (s.is_ascii() && enc != LegacyEncoding::Tcvn3H) || is_already_unicode_vietnamese(s) {
-        return Cow::Borrowed(s);
-    }
-
-    match enc {
-        LegacyEncoding::Tcvn3 => transcode_tcvn3(s),
-        LegacyEncoding::Tcvn3H => transcode_tcvn3_h(s),
-        LegacyEncoding::Vni => transcode_vni(s),
-        LegacyEncoding::Windows1258 => transcode_windows1258(s),
-    }
+    transcode_str_inner(s, font_hint).text
 }
 
 /// Drop-in alias for [`transcode_vietnamese`] matching downstream caller conventions.
@@ -320,25 +326,7 @@ pub fn transcode_explicit<'a>(text: &'a str, encoding: LegacyEncoding) -> Cow<'a
 
 /// Transcode legacy text to Unicode NFC and return detailed status.
 pub fn transcode_to_unicode<'a>(s: &'a str, font_hint: Option<&str>) -> TranscodeResult<'a> {
-    let enc = detect_legacy_encoding(s, font_hint);
-
-    let Some(encoding) = enc else {
-        return TranscodeResult { text: Cow::Borrowed(s), encoding: None, was_transcoded: false };
-    };
-
-    if (s.is_ascii() && encoding != LegacyEncoding::Tcvn3H) || is_already_unicode_vietnamese(s) {
-        return TranscodeResult { text: Cow::Borrowed(s), encoding: Some(encoding), was_transcoded: false };
-    }
-
-    let transcoded = match encoding {
-        LegacyEncoding::Tcvn3 => transcode_tcvn3(s),
-        LegacyEncoding::Tcvn3H => transcode_tcvn3_h(s),
-        LegacyEncoding::Vni => transcode_vni(s),
-        LegacyEncoding::Windows1258 => transcode_windows1258(s),
-    };
-
-    let was_transcoded = matches!(&transcoded, Cow::Owned(_)) || (transcoded.as_ref() != s);
-    TranscodeResult { text: transcoded, encoding: Some(encoding), was_transcoded }
+    transcode_str_inner(s, font_hint)
 }
 
 /// One-shot transcode facade returning a tuple for lightweight callers.

@@ -859,6 +859,20 @@ fn test_short_string_heuristic_inhibition_invariant() {
     let decode_unhinted = decode_text(short_cad_label, &DecodeOptions::default());
     assert!(decode_unhinted.is_err(), "Unhinted short non-UTF8 text must not transcode speculatively");
 
+    // 1b. Exact 15-byte vs 16-byte boundary with 2 valid VNI composites
+    let vni_15 = b"a\xF8 a\xF9          ";
+    assert_eq!(vni_15.len(), 15);
+    assert_eq!(detect_encoding(vni_15, None), DetectionResult::Unknown);
+    assert!(decode_text(vni_15, &DecodeOptions::default()).is_err());
+
+    let vni_16 = b"a\xF8 a\xF9           ";
+    assert_eq!(vni_16.len(), 16);
+    assert_eq!(
+        detect_encoding(vni_16, None),
+        DetectionResult::HighConfidence { encoding: LegacyEncoding::Vni, evidence: EncodingEvidence::Heuristic }
+    );
+    assert_eq!(decode_text(vni_16, &DecodeOptions::default()).as_deref(), Ok("à á           "));
+
     // 2. With FontHint: Overcomes length threshold via Evidence Hierarchy
     let meta = EncodingMetadata { font_name: Some(".VnTime"), codepage_hint: None };
     let with_hint_result = detect_encoding(short_cad_label, Some(&meta));
@@ -1032,4 +1046,27 @@ fn test_zero_dep_vietnamese_nfc_composer() {
     let res = normalize_nfc(non_precomposed);
     assert!(matches!(res, Cow::Borrowed(_)));
     assert_eq!(res.as_ref(), non_precomposed);
+}
+
+#[test]
+fn test_minor_edge_cases_and_tcvn3_cad_escapes() {
+    // 1. AutoCAD %%c escape must be ignored by byte-path all-caps detection
+    assert_eq!(decode(b"%%c B\xB6N", LegacyEncoding::Tcvn3).expect("CAD %%c + BẢN"), "%%c BẢN");
+
+    // 2. CP1252 fallback bytes (0x80..=0x9F, e.g. 0x9C 'œ') must keep original case in all-caps / Tcvn3H
+    assert_eq!(decode_tcvn3(b"B\x9CN", false, DecodeMode::Practical).expect("TCVN3 all-caps preserves œ"), "BœN");
+    assert_eq!(super::transcode_tcvn3_h("b\u{009C}n").as_ref(), "BœN");
+    assert!(matches!(super::transcode_tcvn3_h("BAN VE"), Cow::Borrowed(_)));
+
+    // 3. Invalid-threshold candidate must not tie out a valid candidate
+    // "aø aÐ 1234567890" has VNI=2 (valid) and TCVN3=2 (below threshold 4 => invalid)
+    assert_eq!(
+        detect_encoding_from_str("aø aÐ 1234567890"),
+        DetectionResult::HighConfidence { encoding: LegacyEncoding::Vni, evidence: EncodingEvidence::Heuristic }
+    );
+
+    // 4. Tcvn3H font hint conflicting with VNI bytes preserves Tcvn3H in Ambiguous
+    let vni_bytes = b"a\xF8 a\xF9 e\xF8 e\xF9 e\xF5 u\xF8";
+    let tcvn3h_meta = EncodingMetadata { font_name: Some(".VnTimeH"), codepage_hint: None };
+    assert_eq!(detect_encoding(vni_bytes, Some(&tcvn3h_meta)), DetectionResult::Ambiguous(&[LegacyEncoding::Tcvn3H, LegacyEncoding::Vni]));
 }

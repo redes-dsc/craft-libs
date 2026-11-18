@@ -3,7 +3,9 @@
 //! Standardized by the Directorate for Standards, Metrology and Quality (STAMEQ),
 //! Ministry of Science, Technology and Environment of Vietnam (1993).
 //! Cross-verified with GNU C Library (`glibc`) official charmap specification `TCVN5712-1`.
-//! All conversions deterministically emit standard precomposed Unicode NFC (TCVN 6909:2001).
+//! All decoded outputs deterministically emit standard precomposed Unicode NFC (TCVN 6909:2001).
+//! Pass-through inputs that are not decoded (for example, already-Unicode strings passed to
+//! [`transcode_tcvn3`]) are returned as `Cow::Borrowed` without forcing NFC normalization.
 
 use std::borrow::Cow;
 
@@ -49,43 +51,28 @@ pub const WINDOWS_1252_PUNCTUATION: [Option<char>; 32] = [
     /* 0x9F */ Some('\u{0178}'), // LATIN CAPITAL LETTER Y WITH DIAERESIS (Ÿ)
 ];
 
+/// Build a 128-entry TCVN3 high-byte table (`0x80..=0xFF`) sharing [`WINDOWS_1252_PUNCTUATION`]
+/// for `0x80..=0x9F` and applying the TCVN3 character table for `0xA0..=0xFF`.
+const fn build_tcvn3_table(upper_half: [Option<char>; 96]) -> [Option<char>; 128] {
+    let mut table = [None; 128];
+    let mut i = 0;
+    while i < 32 {
+        table[i] = WINDOWS_1252_PUNCTUATION[i];
+        i += 1;
+    }
+    let mut j = 0;
+    while j < 96 {
+        table[32 + j] = upper_half[j];
+        j += 1;
+    }
+    table
+}
+
 /// TCVN3 Lower Table (.VnTime) for high bytes `0x80..=0xFF`.
 ///
 /// Contains the 7 base uppercase characters in slots `0xA1..=0xA7` (Ă, Â, Ê, Ô, Ơ, Ư, Đ),
 /// base lowercase characters `0xA8..=0xAE`, and all accented lowercase vowels.
-pub const TCVN3_LOWER_MAP: [Option<char>; 128] = [
-    /* 0x80 */ Some('\u{20AC}'), // CP1252 EURO SIGN (€)
-    /* 0x81 */ None,
-    /* 0x82 */ Some('\u{201A}'), // CP1252 SINGLE LOW-9 QUOTATION MARK (‚)
-    /* 0x83 */ Some('\u{0192}'), // CP1252 LATIN SMALL LETTER F WITH HOOK (ƒ)
-    /* 0x84 */ Some('\u{201E}'), // CP1252 DOUBLE LOW-9 QUOTATION MARK („)
-    /* 0x85 */ Some('\u{2026}'), // CP1252 HORIZONTAL ELLIPSIS (…)
-    /* 0x86 */ Some('\u{2020}'), // CP1252 DAGGER (†)
-    /* 0x87 */ Some('\u{2021}'), // CP1252 DOUBLE DAGGER (‡)
-    /* 0x88 */ Some('\u{02C6}'), // CP1252 MODIFIER LETTER CIRCUMFLEX ACCENT (ˆ)
-    /* 0x89 */ Some('\u{2030}'), // CP1252 PER MILLE SIGN (‰)
-    /* 0x8A */ Some('\u{0160}'), // CP1252 LATIN CAPITAL LETTER S WITH CARON (Š)
-    /* 0x8B */ Some('\u{2039}'), // CP1252 SINGLE LEFT-POINTING ANGLE QUOTATION MARK (‹)
-    /* 0x8C */ Some('\u{0152}'), // CP1252 LATIN CAPITAL LIGATURE OE (Œ)
-    /* 0x8D */ None,
-    /* 0x8E */ Some('\u{017D}'), // CP1252 LATIN CAPITAL LETTER Z WITH CARON (Ž)
-    /* 0x8F */ None,
-    /* 0x90 */ None,
-    /* 0x91 */ Some('\u{2018}'), // CP1252 LEFT SINGLE QUOTATION MARK (‘)
-    /* 0x92 */ Some('\u{2019}'), // CP1252 RIGHT SINGLE QUOTATION MARK (’)
-    /* 0x93 */ Some('\u{201C}'), // CP1252 LEFT DOUBLE QUOTATION MARK (“)
-    /* 0x94 */ Some('\u{201D}'), // CP1252 RIGHT DOUBLE QUOTATION MARK (”)
-    /* 0x95 */ Some('\u{2022}'), // CP1252 BULLET (•)
-    /* 0x96 */ Some('\u{2013}'), // CP1252 EN DASH (–)
-    /* 0x97 */ Some('\u{2014}'), // CP1252 EM DASH (—)
-    /* 0x98 */ Some('\u{02DC}'), // CP1252 SMALL TILDE (˜)
-    /* 0x99 */ Some('\u{2122}'), // CP1252 TRADE MARK SIGN (™)
-    /* 0x9A */ Some('\u{0161}'), // CP1252 LATIN SMALL LETTER S WITH CARON (š)
-    /* 0x9B */ Some('\u{203A}'), // CP1252 SINGLE RIGHT-POINTING ANGLE QUOTATION MARK (›)
-    /* 0x9C */ Some('\u{0153}'), // CP1252 LATIN SMALL LIGATURE OE (œ)
-    /* 0x9D */ None,
-    /* 0x9E */ Some('\u{017E}'), // CP1252 LATIN SMALL LETTER Z WITH CARON (ž)
-    /* 0x9F */ Some('\u{0178}'), // CP1252 LATIN CAPITAL LETTER Y WITH DIAERESIS (Ÿ)
+pub const TCVN3_LOWER_MAP: [Option<char>; 128] = build_tcvn3_table([
     /* 0xA0 */ Some('\u{00A0}'), // NO-BREAK SPACE
     /* 0xA1 */ Some('Ă'), // Ă base upper in lower font
     /* 0xA2 */ Some('Â'), // Â base upper in lower font
@@ -182,44 +169,12 @@ pub const TCVN3_LOWER_MAP: [Option<char>; 128] = [
     /* 0xFD */ Some('ý'), // y sắc
     /* 0xFE */ Some('ỵ'), // y nặng
     /* 0xFF */ None,
-];
+]);
 
 /// TCVN3 Upper Table (.VnTimeH) for high bytes `0x80..=0xFF`.
 ///
 /// Maps all lowercase vowel slots to their uppercase Unicode equivalents for all-caps fonts.
-pub const TCVN3_UPPER_MAP: [Option<char>; 128] = [
-    /* 0x80 */ Some('\u{20AC}'), // CP1252 EURO SIGN (€)
-    /* 0x81 */ None,
-    /* 0x82 */ Some('\u{201A}'), // CP1252 SINGLE LOW-9 QUOTATION MARK (‚)
-    /* 0x83 */ Some('\u{0192}'), // CP1252 LATIN SMALL LETTER F WITH HOOK (ƒ)
-    /* 0x84 */ Some('\u{201E}'), // CP1252 DOUBLE LOW-9 QUOTATION MARK („)
-    /* 0x85 */ Some('\u{2026}'), // CP1252 HORIZONTAL ELLIPSIS (…)
-    /* 0x86 */ Some('\u{2020}'), // CP1252 DAGGER (†)
-    /* 0x87 */ Some('\u{2021}'), // CP1252 DOUBLE DAGGER (‡)
-    /* 0x88 */ Some('\u{02C6}'), // CP1252 MODIFIER LETTER CIRCUMFLEX ACCENT (ˆ)
-    /* 0x89 */ Some('\u{2030}'), // CP1252 PER MILLE SIGN (‰)
-    /* 0x8A */ Some('\u{0160}'), // CP1252 LATIN CAPITAL LETTER S WITH CARON (Š)
-    /* 0x8B */ Some('\u{2039}'), // CP1252 SINGLE LEFT-POINTING ANGLE QUOTATION MARK (‹)
-    /* 0x8C */ Some('\u{0152}'), // CP1252 LATIN CAPITAL LIGATURE OE (Œ)
-    /* 0x8D */ None,
-    /* 0x8E */ Some('\u{017D}'), // CP1252 LATIN CAPITAL LETTER Z WITH CARON (Ž)
-    /* 0x8F */ None,
-    /* 0x90 */ None,
-    /* 0x91 */ Some('\u{2018}'), // CP1252 LEFT SINGLE QUOTATION MARK (‘)
-    /* 0x92 */ Some('\u{2019}'), // CP1252 RIGHT SINGLE QUOTATION MARK (’)
-    /* 0x93 */ Some('\u{201C}'), // CP1252 LEFT DOUBLE QUOTATION MARK (“)
-    /* 0x94 */ Some('\u{201D}'), // CP1252 RIGHT DOUBLE QUOTATION MARK (”)
-    /* 0x95 */ Some('\u{2022}'), // CP1252 BULLET (•)
-    /* 0x96 */ Some('\u{2013}'), // CP1252 EN DASH (–)
-    /* 0x97 */ Some('\u{2014}'), // CP1252 EM DASH (—)
-    /* 0x98 */ Some('\u{02DC}'), // CP1252 SMALL TILDE (˜)
-    /* 0x99 */ Some('\u{2122}'), // CP1252 TRADE MARK SIGN (™)
-    /* 0x9A */ Some('\u{0161}'), // CP1252 LATIN SMALL LETTER S WITH CARON (š)
-    /* 0x9B */ Some('\u{203A}'), // CP1252 SINGLE RIGHT-POINTING ANGLE QUOTATION MARK (›)
-    /* 0x9C */ Some('\u{0153}'), // CP1252 LATIN SMALL LIGATURE OE (œ)
-    /* 0x9D */ None,
-    /* 0x9E */ Some('\u{017E}'), // CP1252 LATIN SMALL LETTER Z WITH CARON (ž)
-    /* 0x9F */ Some('\u{0178}'), // CP1252 LATIN CAPITAL LETTER Y WITH DIAERESIS (Ÿ)
+pub const TCVN3_UPPER_MAP: [Option<char>; 128] = build_tcvn3_table([
     /* 0xA0 */ Some('\u{00A0}'), // NO-BREAK SPACE
     /* 0xA1 */ Some('Ă'), // Upper of Ă base upper in lower font
     /* 0xA2 */ Some('Â'), // Upper of Â base upper in lower font
@@ -316,7 +271,7 @@ pub const TCVN3_UPPER_MAP: [Option<char>; 128] = [
     /* 0xFD */ Some('Ý'), // Upper of y sắc
     /* 0xFE */ Some('Ỵ'), // Upper of y nặng
     /* 0xFF */ None,
-];
+]);
 
 /// Match a single Latin-1 char in TCVN3 lower mapping table.
 pub(crate) fn match_tcvn3_single(c: char) -> Option<char> {
@@ -326,24 +281,28 @@ pub(crate) fn match_tcvn3_single(c: char) -> Option<char> {
 
 /// Check whether an ASCII string or %-escaped CAD control represents uppercase TCVN3 text.
 pub(crate) fn is_tcvn3_all_caps(s: &str) -> bool {
+    is_tcvn3_bytes_all_caps(s.as_bytes())
+}
+
+/// Check whether a raw byte slice (ignoring AutoCAD `%%` control escapes) contains uppercase ASCII letters
+/// and no lowercase ASCII letters.
+pub(crate) fn is_tcvn3_bytes_all_caps(bytes: &[u8]) -> bool {
     let mut has_upper = false;
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' && chars.peek() == Some(&'%') {
-            chars.next();
-            if let Some(&next) = chars.peek() {
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && bytes.get(i + 1) == Some(&b'%') {
+            i += 2;
+            if let Some(&next) = bytes.get(i) {
                 if next.is_ascii_alphabetic() {
-                    chars.next();
+                    i += 1;
                     continue;
                 }
                 if next.is_ascii_digit() {
                     for _ in 0..3 {
-                        if let Some(&d) = chars.peek() {
-                            if d.is_ascii_digit() {
-                                chars.next();
-                            } else {
-                                break;
-                            }
+                        if bytes.get(i).is_some_and(u8::is_ascii_digit) {
+                            i += 1;
+                        } else {
+                            break;
                         }
                     }
                     continue;
@@ -351,26 +310,14 @@ pub(crate) fn is_tcvn3_all_caps(s: &str) -> bool {
             }
             continue;
         }
-        if c.is_ascii_lowercase() {
-            return false;
-        }
-        if c.is_ascii_uppercase() {
-            has_upper = true;
-        }
-    }
-    has_upper
-}
-
-/// Check whether a raw byte slice contains only uppercase ASCII letters and no lowercase ASCII letters.
-pub(crate) fn is_tcvn3_bytes_all_caps(bytes: &[u8]) -> bool {
-    let mut has_upper = false;
-    for &b in bytes {
+        let b = bytes[i];
         if b.is_ascii_lowercase() {
             return false;
         }
         if b.is_ascii_uppercase() {
             has_upper = true;
         }
+        i += 1;
     }
     has_upper
 }
@@ -504,7 +451,7 @@ pub fn decode_tcvn3(input: &[u8], is_upper: bool, mode: DecodeMode) -> Result<Co
                     if mode == DecodeMode::Strict && (0x80..=0x9F).contains(&byte) {
                         return Err(DecodeError::UnmappedByte { byte, offset: i, encoding: enc });
                     }
-                    if all_caps {
+                    if all_caps && byte >= 0xA0 {
                         out.extend(c.to_uppercase());
                     } else {
                         out.push(c);
@@ -549,25 +496,26 @@ pub fn transcode_tcvn3(s: &str) -> Cow<'_, str> {
 /// Transcode a TCVN3H all-uppercase string to Unicode NFC uppercase.
 pub fn transcode_tcvn3_h(s: &str) -> Cow<'_, str> {
     if s.is_ascii() {
-        let upper = s.to_uppercase();
-        if upper == s { Cow::Borrowed(s) } else { Cow::Owned(upper) }
-    } else {
-        let mut bytes = Vec::with_capacity(s.len());
-        for c in s.chars() {
-            let code = c as u32;
-            if code > 0xFF {
-                return Cow::Borrowed(s);
-            }
-            bytes.push(code as u8);
+        if !s.bytes().any(|b| b.is_ascii_lowercase()) {
+            return Cow::Borrowed(s);
         }
+        return Cow::Owned(s.to_ascii_uppercase());
+    }
 
-        match decode_tcvn3(&bytes, true, DecodeMode::Practical) {
-            Ok(decoded) => {
-                let nfc = super::normalize_nfc(&decoded);
-                let upper = nfc.to_uppercase();
-                if upper == s { Cow::Borrowed(s) } else { Cow::Owned(upper) }
-            }
-            Err(_) => Cow::Borrowed(s),
+    let mut bytes = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let code = c as u32;
+        if code > 0xFF {
+            return Cow::Borrowed(s);
         }
+        bytes.push(code as u8);
+    }
+
+    match decode_tcvn3(&bytes, true, DecodeMode::Practical) {
+        Ok(decoded) => {
+            let nfc = super::normalize_nfc(&decoded);
+            if nfc.as_ref() == s { Cow::Borrowed(s) } else { Cow::Owned(nfc.into_owned()) }
+        }
+        Err(_) => Cow::Borrowed(s),
     }
 }
