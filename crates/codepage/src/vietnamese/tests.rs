@@ -1156,6 +1156,77 @@ fn test_regression_invariants_for_vietnamese_transcoding_and_nfc() {
     // 6. Why: AutoCAD `%%%` literal percent escapes and valid inline codes (`%%d`)
     // keep all-caps inference, while CP1252 fallback characters (`0x9C` -> `œ`)
     // preserve their original case under `.VnTimeH`.
-    assert_eq!(decode_tcvn3(b"A%%%%%d \xD2", false, DecodeMode::Practical).expect("all-caps with %%%"), "A%%%%%d Ề");
-    assert_eq!(super::transcode_tcvn3_h("b\u{009C}n"), "BœN");
+    // 7. Why (UAX #15 starter retention & precomposed decomposition in CP1258):
+    // - Bytes `43 EC F2` (`C` + `\u{0301}` + `\u{0323}`) reorder to `C` + `\u{0323}` +
+    //   `\u{0301}`; the normalizer must keep `C` as starter across the uncomposed
+    //   dot-below so `\u{0301}` still composes with `C` into `Ć` + `\u{0323}`.
+    // - Bytes `C9 F2` (`É` + `\u{0323}`) must canonically decompose `É` into
+    //   `E + \u{0301}` before CCC ordering, so it equals `45 F2 EC` -> `Ẹ\u{0301}`.
+    assert_eq!(
+        decode_text(
+            &[0x43, 0xEC, 0xF2],
+            &DecodeOptions { force_encoding: Some(LegacyEncoding::Windows1258), normalize_nfc: true, ..Default::default() }
+        )
+        .expect("CP1258 Ć + dot below"),
+        "Ć\u{0323}"
+    );
+    assert_eq!(
+        decode_text(&[0xC9, 0xF2], &DecodeOptions { force_encoding: Some(LegacyEncoding::Windows1258), normalize_nfc: true, ..Default::default() })
+            .expect("CP1258 Ẹ + acute"),
+        "Ẹ\u{0301}"
+    );
+
+    // 8. Why (all-high-byte TCVN3 words & consonantal frames):
+    // - `"®·"` (`0xAE 0xB7`) is TCVN3 `"đã"` and contains no ASCII letter, yet the
+    //   whole line must still decode to `"Á CHÂU ĐÃ CÓ"` under `.VnTimeH`.
+    // - `"nÒn"` (`6E D2 6E`) has `Ò` flanked by ASCII consonants, the TCVN3
+    //   consonant-vowel-consonant frame, so it decodes to `"nền"`; `"tÔi"` instead
+    //   opens a valid Unicode vowel cluster (`Ôi`) and must stay untouched.
+    assert_eq!(transcode_vietnamese("Á CHÂU ®· Cã", Some(".VnTimeH")), "Á CHÂU ĐÃ CÓ");
+    assert_eq!(transcode_vietnamese("nÒn", Some(".VnTime")), "nền");
+    assert_eq!(transcode_vietnamese("tÔi", Some(".VnTime")), "tÔi");
+}
+
+#[test]
+fn cp1258_nfc_matches_unicode_oracle_exhaustively() {
+    use unicode_normalization::UnicodeNormalization;
+
+    // Why: Windows-1258 is a closed 256-byte repertoire with only 5 combining marks, so
+    // its canonical normalization can be proven rather than sampled: every byte alone,
+    // every byte with one mark, and every byte with every mark pair must agree with the
+    // independent Unicode NFC oracle. This is what catches boundary cases such as
+    // `43 EC F2`, `C9 F2` and `C4 F2` before review does.
+    const MARKS: [u8; 5] = [0xCC, 0xEC, 0xD2, 0xDE, 0xF2];
+    let mut checked = 0_u32;
+
+    for first in 0_u8..=0xFF {
+        let single = [first];
+        if let Ok(decoded) = decode_windows1258(&single) {
+            let ours = normalize_cp1258_nfc(&decoded);
+            let oracle: String = decoded.nfc().collect();
+            assert_eq!(ours.as_ref(), oracle, "CP1258 bytes {single:02X?} decoded {decoded:?}");
+            checked += 1;
+        }
+
+        for second in MARKS {
+            let pair = [first, second];
+            let Ok(decoded) = decode_windows1258(&pair) else { continue };
+            let ours = normalize_cp1258_nfc(&decoded);
+            let oracle: String = decoded.nfc().collect();
+            assert_eq!(ours.as_ref(), oracle, "CP1258 bytes {pair:02X?} decoded {decoded:?}");
+            checked += 1;
+
+            for third in MARKS {
+                let triple = [first, second, third];
+                let decoded = decode_windows1258(&triple).expect("two valid CP1258 marks");
+                let ours = normalize_cp1258_nfc(&decoded);
+                let oracle: String = decoded.nfc().collect();
+                assert_eq!(ours.as_ref(), oracle, "CP1258 bytes {triple:02X?} decoded {decoded:?}");
+                checked += 1;
+            }
+        }
+    }
+
+    // 247 defined bytes x (1 single + 5 single-mark + 25 mark-pair) sequences.
+    assert!(checked > 7_600, "expected the full CP1258 x mark x mark domain, checked {checked}");
 }

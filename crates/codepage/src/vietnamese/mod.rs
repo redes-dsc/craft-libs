@@ -388,9 +388,17 @@ pub fn is_serif_legacy_font(font: &str) -> bool {
         || lower.contains("palatin")
 }
 
+/// Canonical Combining Class (UAX #15) of every combining mark in the Vietnamese and
+/// Windows-1258 repertoires. Starters (and characters outside this repertoire) return `0`.
 #[inline]
-const fn is_vietnamese_combining_mark(c: char) -> bool {
-    matches!(c, '\u{0300}' | '\u{0301}' | '\u{0302}' | '\u{0303}' | '\u{0306}' | '\u{0309}' | '\u{031B}' | '\u{0323}')
+const fn combining_class(c: char) -> u8 {
+    match c {
+        '\u{0327}' => 202, // cedilla
+        '\u{031B}' => 216, // horn
+        '\u{0323}' => 220, // dot below
+        '\u{0300}' | '\u{0301}' | '\u{0302}' | '\u{0303}' | '\u{0306}' | '\u{0308}' | '\u{0309}' | '\u{030A}' | '\u{030C}' => 230,
+        _ => 0,
+    }
 }
 
 /// Zero-dependency canonical pair composition for Vietnamese vowels and combining diacritics.
@@ -576,10 +584,13 @@ pub const fn compose_cp1258_pair(base: char, mark: char) -> Option<char> {
     }
     Some(match (base, mark) {
         // U+0300 COMBINING GRAVE ACCENT
-        ('N', '\u{0300}') => '\u{01F8}', // Ǹ
-        ('n', '\u{0300}') => '\u{01F9}', // ǹ
-        ('W', '\u{0300}') => '\u{1E80}', // Ẁ
-        ('w', '\u{0300}') => '\u{1E81}', // ẁ
+        ('N', '\u{0300}') => '\u{01F8}',        // Ǹ
+        ('n', '\u{0300}') => '\u{01F9}',        // ǹ
+        ('W', '\u{0300}') => '\u{1E80}',        // Ẁ
+        ('w', '\u{0300}') => '\u{1E81}',        // ẁ
+        ('\u{00A8}', '\u{0300}') => '\u{1FED}', // ῭ (Greek dialytika and varia)
+        ('\u{00DC}', '\u{0300}') => '\u{01DB}', // Ǜ
+        ('\u{00FC}', '\u{0300}') => '\u{01DC}', // ǜ
         // U+0301 COMBINING ACUTE ACCENT
         ('C', '\u{0301}') => '\u{0106}',        // Ć
         ('c', '\u{0301}') => '\u{0107}',        // ć
@@ -587,6 +598,19 @@ pub const fn compose_cp1258_pair(base: char, mark: char) -> Option<char> {
         ('\u{00E7}', '\u{0301}') => '\u{1E09}', // ḉ
         ('\u{00DC}', '\u{0301}') => '\u{01D7}', // Ǘ (Ü + U+0301)
         ('\u{00FC}', '\u{0301}') => '\u{01D8}', // ǘ (ü + U+0301, e.g. 0xFC 0xEC)
+        ('\u{00A8}', '\u{0301}') => '\u{0385}', // ΅ (Greek dialytika tonos)
+        ('\u{00C5}', '\u{0301}') => '\u{01FA}', // Ǻ
+        ('\u{00E5}', '\u{0301}') => '\u{01FB}', // ǻ
+        ('\u{00C6}', '\u{0301}') => '\u{01FC}', // Ǽ
+        ('\u{00E6}', '\u{0301}') => '\u{01FD}', // ǽ
+        ('\u{00CF}', '\u{0301}') => '\u{1E2E}', // Ḯ
+        ('\u{00EF}', '\u{0301}') => '\u{1E2F}', // ḯ
+        ('\u{00D5}', '\u{0301}') => '\u{1E4C}', // Ṍ
+        ('\u{00F5}', '\u{0301}') => '\u{1E4D}', // ṍ
+        ('\u{00D8}', '\u{0301}') => '\u{01FE}', // Ǿ
+        ('\u{00F8}', '\u{0301}') => '\u{01FF}', // ǿ
+        ('\u{0168}', '\u{0301}') => '\u{1E78}', // Ṹ
+        ('\u{0169}', '\u{0301}') => '\u{1E79}', // ṹ
         ('G', '\u{0301}') => '\u{01F4}',        // Ǵ
         ('g', '\u{0301}') => '\u{01F5}',        // ǵ
         ('K', '\u{0301}') => '\u{1E30}',        // Ḱ
@@ -639,129 +663,215 @@ pub const fn compose_cp1258_pair(base: char, mark: char) -> Option<char> {
         ('w', '\u{0323}') => '\u{1E89}', // ẉ
         ('Z', '\u{0323}') => '\u{1E92}', // Ẓ
         ('z', '\u{0323}') => '\u{1E93}', // ẓ
+        // U+0302 COMBINING CIRCUMFLEX ACCENT (Latin-1 Î/Û; Vietnamese only uses â/ê/ô)
+        ('I', '\u{0302}') => '\u{00CE}', // Î
+        ('i', '\u{0302}') => '\u{00EE}', // î
+        ('U', '\u{0302}') => '\u{00DB}', // Û
+        ('u', '\u{0302}') => '\u{00FB}', // û
+        // U+0308 COMBINING DIAERESIS
+        ('A', '\u{0308}') => '\u{00C4}', // Ä
+        ('a', '\u{0308}') => '\u{00E4}', // ä
+        ('E', '\u{0308}') => '\u{00CB}', // Ë
+        ('e', '\u{0308}') => '\u{00EB}', // ë
+        ('I', '\u{0308}') => '\u{00CF}', // Ï
+        ('i', '\u{0308}') => '\u{00EF}', // ï
+        ('O', '\u{0308}') => '\u{00D6}', // Ö
+        ('o', '\u{0308}') => '\u{00F6}', // ö
+        ('U', '\u{0308}') => '\u{00DC}', // Ü
+        ('u', '\u{0308}') => '\u{00FC}', // ü
+        ('Y', '\u{0308}') => '\u{0178}', // Ÿ
+        ('y', '\u{0308}') => '\u{00FF}', // ÿ
+        // U+030A COMBINING RING ABOVE
+        ('A', '\u{030A}') => '\u{00C5}', // Å
+        ('a', '\u{030A}') => '\u{00E5}', // å
+        // U+030C COMBINING CARON
+        ('S', '\u{030C}') => '\u{0160}', // Š
+        ('s', '\u{030C}') => '\u{0161}', // š
+        ('Z', '\u{030C}') => '\u{017D}', // Ž
+        ('z', '\u{030C}') => '\u{017E}', // ž
+        // U+0327 COMBINING CEDILLA
+        ('C', '\u{0327}') => '\u{00C7}', // Ç
+        ('c', '\u{0327}') => '\u{00E7}', // ç
         _ => return None,
     })
 }
 
-/// Canonical combining class of the five combining marks in the CP1258 repertoire.
+/// Primary canonical decomposition (UAX #15) of one Windows-1258 repertoire character.
 ///
-/// `U+0323` COMBINING DOT BELOW carries ccc 220, whereas `U+0300`, `U+0301`,
-/// `U+0303` and `U+0309` carry ccc 230, so canonical order puts the dot below first.
+/// Every entry is a single-step decomposition into a starter and one combining mark, so
+/// the normalizer never needs to recurse. Characters without a canonical decomposition
+/// (`Đ`, `đ`, `Ø`, `Æ`, `ß`, ...) return `None`. Decomposing first is what makes
+/// `É` + `U+0323` normalize like its canonically equivalent `E` + `U+0323` + `U+0301`.
+const fn decompose_cp1258_char(c: char) -> Option<(char, char)> {
+    Some(match c {
+        'À' => ('A', '\u{0300}'),
+        'Á' => ('A', '\u{0301}'),
+        'Â' => ('A', '\u{0302}'),
+        'Ã' => ('A', '\u{0303}'),
+        'Ä' => ('A', '\u{0308}'),
+        'Å' => ('A', '\u{030A}'),
+        'Ă' => ('A', '\u{0306}'),
+        'Ç' => ('C', '\u{0327}'),
+        'È' => ('E', '\u{0300}'),
+        'É' => ('E', '\u{0301}'),
+        'Ê' => ('E', '\u{0302}'),
+        'Ë' => ('E', '\u{0308}'),
+        'Ì' => ('I', '\u{0300}'),
+        'Í' => ('I', '\u{0301}'),
+        'Î' => ('I', '\u{0302}'),
+        'Ï' => ('I', '\u{0308}'),
+        'Ñ' => ('N', '\u{0303}'),
+        'Ò' => ('O', '\u{0300}'),
+        'Ó' => ('O', '\u{0301}'),
+        'Ô' => ('O', '\u{0302}'),
+        'Õ' => ('O', '\u{0303}'),
+        'Ö' => ('O', '\u{0308}'),
+        'Ơ' => ('O', '\u{031B}'),
+        'Ù' => ('U', '\u{0300}'),
+        'Ú' => ('U', '\u{0301}'),
+        'Û' => ('U', '\u{0302}'),
+        'Ü' => ('U', '\u{0308}'),
+        'Ư' => ('U', '\u{031B}'),
+        'Ý' => ('Y', '\u{0301}'),
+        'à' => ('a', '\u{0300}'),
+        'á' => ('a', '\u{0301}'),
+        'â' => ('a', '\u{0302}'),
+        'ã' => ('a', '\u{0303}'),
+        'ä' => ('a', '\u{0308}'),
+        'å' => ('a', '\u{030A}'),
+        'ă' => ('a', '\u{0306}'),
+        'ç' => ('c', '\u{0327}'),
+        'è' => ('e', '\u{0300}'),
+        'é' => ('e', '\u{0301}'),
+        'ê' => ('e', '\u{0302}'),
+        'ë' => ('e', '\u{0308}'),
+        'ì' => ('i', '\u{0300}'),
+        'í' => ('i', '\u{0301}'),
+        'î' => ('i', '\u{0302}'),
+        'ï' => ('i', '\u{0308}'),
+        'ñ' => ('n', '\u{0303}'),
+        'ò' => ('o', '\u{0300}'),
+        'ó' => ('o', '\u{0301}'),
+        'ô' => ('o', '\u{0302}'),
+        'õ' => ('o', '\u{0303}'),
+        'ö' => ('o', '\u{0308}'),
+        'ơ' => ('o', '\u{031B}'),
+        'ù' => ('u', '\u{0300}'),
+        'ú' => ('u', '\u{0301}'),
+        'û' => ('u', '\u{0302}'),
+        'ü' => ('u', '\u{0308}'),
+        'ư' => ('u', '\u{031B}'),
+        'ý' => ('y', '\u{0301}'),
+        'ÿ' => ('y', '\u{0308}'),
+        'Š' => ('S', '\u{030C}'),
+        'š' => ('s', '\u{030C}'),
+        'Ž' => ('Z', '\u{030C}'),
+        'ž' => ('z', '\u{030C}'),
+        'Ÿ' => ('Y', '\u{0308}'),
+        _ => return None,
+    })
+}
+
+/// Identity decomposition for strings already in precomposed Vietnamese form.
 #[inline]
-const fn cp1258_mark_ccc(c: char) -> Option<u8> {
-    match c {
-        '\u{0323}' => Some(220),
-        '\u{0300}' | '\u{0301}' | '\u{0303}' | '\u{0309}' => Some(230),
-        _ => None,
-    }
+const fn keep_precomposed(_: char) -> Option<(char, char)> {
+    None
 }
 
-/// Appends one run of adjacent CP1258 combining marks in canonical combining class order.
-fn push_canonical_cp1258_mark_run(out: &mut String, run: &str) {
-    out.extend(run.chars().filter(|&c| cp1258_mark_ccc(c) == Some(220)));
-    out.extend(run.chars().filter(|&c| cp1258_mark_ccc(c) == Some(230)));
-}
-
-/// Canonicalizes CP1258 combining mark order (ccc 220 dot below `U+0323` before
-/// ccc 230 top accents `U+0300`, `U+0301`, `U+0303`, `U+0309`) prior to pair
-/// composition, so sequences like `0xEC 0xF2 0x41` (`"\u{0301}\u{0323}A"`)
-/// normalize to NFC `"\u{0323}\u{0301}A"`.
+/// Canonical UAX #15 normalization (decompose, order by Canonical Combining Class,
+/// recompose around the last starter) restricted to a closed character repertoire.
 ///
-/// Returns `Cow::Borrowed(s)` when every mark run is already in canonical order.
-fn canonicalize_cp1258_mark_order(s: &str) -> Cow<'_, str> {
-    let mut chars = s.chars();
-    let mut prev = chars.next();
-    let mut needs_reorder = false;
+/// The three steps are kept separate on purpose. Skipping decomposition loses
+/// canonical equivalence (`É` + `U+0323` must equal `E` + `U+0323` + `U+0301`), and
+/// collapsing the starter with the last mark loses recomposition after a failed pair
+/// (`C` + `U+0323` + `U+0301` is `Ć` + `U+0323`, because ccc 220 does not block ccc 230).
+fn normalize_with<'a>(s: &'a str, decompose: fn(char) -> Option<(char, char)>, composer: fn(char, char) -> Option<char>) -> Cow<'a, str> {
+    if s.is_ascii() || !s.chars().any(|c| combining_class(c) != 0 || decompose(c).is_some()) {
+        return Cow::Borrowed(s);
+    }
+
+    // Step 1: canonical decomposition.
+    let mut chars: Vec<char> = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        match decompose(c) {
+            Some((base, mark)) => {
+                chars.push(base);
+                chars.push(mark);
+            }
+            None => chars.push(c),
+        }
+    }
+
+    // Step 2: canonical ordering, a stable insertion sort inside each run of marks.
+    let mut idx = 0;
+    while idx < chars.len() {
+        if combining_class(chars[idx]) == 0 {
+            idx += 1;
+            continue;
+        }
+        let start = idx;
+        while idx < chars.len() && combining_class(chars[idx]) != 0 {
+            idx += 1;
+        }
+        for j in start + 1..idx {
+            let mark = chars[j];
+            let class = combining_class(mark);
+            let mut k = j;
+            while k > start && combining_class(chars[k - 1]) > class {
+                chars[k] = chars[k - 1];
+                k -= 1;
+            }
+            chars[k] = mark;
+        }
+    }
+
+    // Step 3: canonical recomposition. The starter survives a mark it cannot compose
+    // with, so a later mark of a higher class can still compose with it (UAX #15 D115).
+    let mut out: Vec<char> = Vec::with_capacity(chars.len());
+    let mut starter: Option<usize> = None;
+    let mut last_class = 0_u8;
     for c in chars {
-        if prev.is_some_and(|p| cp1258_mark_ccc(p) == Some(230)) && cp1258_mark_ccc(c) == Some(220) {
-            needs_reorder = true;
-            break;
+        let class = combining_class(c);
+        if class != 0
+            && let Some(pos) = starter
+            && last_class < class
+            && let Some(composed) = composer(out[pos], c)
+        {
+            out[pos] = composed;
+            continue;
         }
-        prev = Some(c);
-    }
-    if !needs_reorder {
-        return Cow::Borrowed(s);
-    }
-
-    let mut out = String::with_capacity(s.len());
-    let mut run_start: Option<usize> = None;
-    for (idx, c) in s.char_indices() {
-        match (cp1258_mark_ccc(c).is_some(), run_start) {
-            (true, None) => run_start = Some(idx),
-            (true, Some(_)) => {}
-            (false, Some(start)) => {
-                push_canonical_cp1258_mark_run(&mut out, &s[start..idx]);
-                run_start = None;
-                out.push(c);
-            }
-            (false, None) => out.push(c),
+        if class == 0 {
+            starter = Some(out.len());
         }
-    }
-    if let Some(start) = run_start {
-        push_canonical_cp1258_mark_run(&mut out, &s[start..]);
-    }
-    Cow::Owned(out)
-}
-
-/// Composes a CP1258 string to NFC with [`compose_cp1258_pair`].
-#[inline]
-fn normalize_cp1258_composed(s: &str) -> Cow<'_, str> {
-    normalize_with(s, compose_cp1258_pair)
-}
-
-#[inline]
-fn normalize_with<'a>(s: &'a str, composer: fn(char, char) -> Option<char>) -> Cow<'a, str> {
-    if s.is_ascii() || !s.chars().any(is_vietnamese_combining_mark) {
-        return Cow::Borrowed(s);
+        last_class = class;
+        out.push(c);
     }
 
-    let mut out: Option<String> = None;
-    let mut prev: Option<(usize, char)> = None;
-
-    for (idx, c) in s.char_indices() {
-        if let Some((prev_idx, prev_ch)) = prev {
-            if let Some(composed) = composer(prev_ch, c) {
-                let _ = out.get_or_insert_with(|| {
-                    let mut buf = String::with_capacity(s.len());
-                    buf.push_str(&s[..prev_idx]);
-                    buf
-                });
-                prev = Some((prev_idx, composed));
-                continue;
-            }
-            if let Some(buf) = out.as_mut() {
-                buf.push(prev_ch);
-            }
-        }
-        prev = Some((idx, c));
-    }
-
-    match (out, prev) {
-        (Some(mut buf), Some((_, last))) => {
-            buf.push(last);
-            Cow::Owned(buf)
-        }
-        (Some(buf), None) => Cow::Owned(buf),
-        (None, _) => Cow::Borrowed(s),
-    }
+    let normalized: String = out.into_iter().collect();
+    if normalized == s { Cow::Borrowed(s) } else { Cow::Owned(normalized) }
 }
 
 /// Normalize a Vietnamese string to precomposed Unicode Normalization Form C (NFC)
 /// using zero runtime dependencies.
 ///
+/// Input is expected to be either precomposed or a decomposition over Vietnamese
+/// base letters, so it is not canonically decomposed first; ordering and recomposition
+/// still follow UAX #15.
+///
 /// Returns `Cow::Borrowed` with zero allocations when the string is ASCII or already composed.
 pub fn normalize_nfc<'a>(s: &'a str) -> Cow<'a, str> {
-    normalize_with(s, compose_vietnamese_pair)
+    normalize_with(s, keep_precomposed, compose_vietnamese_pair)
 }
 
 /// Normalize a Windows-1258 decoded string to Unicode Normalization Form C (NFC),
-/// composing both Vietnamese vowels and the 50 non-Vietnamese CP1258 component+mark pairs.
+/// composing both Vietnamese vowels and the non-Vietnamese CP1258 component+mark pairs.
 ///
-/// Combining marks are first put in Canonical Combining Class order by
-/// [`canonicalize_cp1258_mark_order`], so `U+0323` (ccc 220) precedes `U+0300`,
-/// `U+0301`, `U+0303` and `U+0309` (ccc 230) before pair composition.
+/// Implements the three UAX #15 steps: every precomposed CP1258 character is
+/// canonically decomposed (`decompose_cp1258_char`), marks are ordered by Canonical
+/// Combining Class (so ccc 220 `U+0323` precedes ccc 230 `U+0300`/`U+0301`/`U+0303`/`U+0309`),
+/// and the result is recomposed around the last starter.
 ///
 /// Returns `Cow::Borrowed` with zero allocations when the string is ASCII or already composed.
 pub fn normalize_cp1258_nfc<'a>(s: &'a str) -> Cow<'a, str> {
-    apply_nfc_cow_with(canonicalize_cp1258_mark_order(s), normalize_cp1258_composed)
+    normalize_with(s, decompose_cp1258_char, compose_cp1258_pair)
 }

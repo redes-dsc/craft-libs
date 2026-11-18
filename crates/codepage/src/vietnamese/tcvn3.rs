@@ -468,13 +468,17 @@ pub fn decode_tcvn3(input: &[u8], is_upper: bool, mode: DecodeMode) -> Result<Co
     Ok(Cow::Owned(out))
 }
 
-/// Returns `true` for one of the 41 TCVN3 Latin-1 slots in `0xA8..=0xFE` whose
-/// Unicode Latin-1 equivalents are NOT valid Vietnamese letters (`«`, `¬`, `×`,
-/// `Ø`, `Ð`, `Þ`, `ß`, `Ç`, `Ü`, `þ`, etc.).
+/// Returns `true` for one of the 40 TCVN3 Latin-1 slots in `0xA8..=0xFE` whose Unicode
+/// Latin-1 equivalents are NOT valid Vietnamese letters (`«`, `¬`, `×`, `Ø`, `Ð`, `Þ`,
+/// `ß`, `Ç`, `Ü`, `þ`, etc.).
+///
+/// `©` (`0xA9`, TCVN3 `â`) is deliberately excluded: it is a copyright sign in both
+/// repertoires, so standalone occurrences such as `"TÒA ÁN © 2026"` are Unicode text.
 const fn is_unambiguous_tcvn3_latin1_marker(c: char) -> bool {
     matches!(
         c as u32,
-        0xA8..=0xAE
+        0xA8
+            | 0xAA..=0xAE
             | 0xB5..=0xB9
             | 0xBB..=0xBE
             | 0xC6..=0xC7
@@ -492,17 +496,78 @@ const fn is_unambiguous_tcvn3_latin1_marker(c: char) -> bool {
     )
 }
 
+/// Returns `true` when `c` is a letter in the TCVN3 tables.
+#[inline]
+fn is_tcvn3_letter(c: char) -> bool {
+    c.is_ascii_alphabetic() || match_tcvn3_single(c).is_some_and(char::is_alphabetic)
+}
+
+/// Returns `true` when `c` is a vowel in the Latin/Vietnamese repertoire.
+#[inline]
+const fn is_unicode_vowel(c: char) -> bool {
+    matches!(
+        c,
+        'a' | 'e'
+            | 'i'
+            | 'o'
+            | 'u'
+            | 'y'
+            | 'A'
+            | 'E'
+            | 'I'
+            | 'O'
+            | 'U'
+            | 'Y'
+            | 'à'
+            | 'á'
+            | 'â'
+            | 'ã'
+            | 'è'
+            | 'é'
+            | 'ê'
+            | 'ì'
+            | 'í'
+            | 'ò'
+            | 'ó'
+            | 'ô'
+            | 'õ'
+            | 'ù'
+            | 'ú'
+            | 'ý'
+            | 'À'
+            | 'Á'
+            | 'Â'
+            | 'Ã'
+            | 'È'
+            | 'É'
+            | 'Ê'
+            | 'Ì'
+            | 'Í'
+            | 'Ò'
+            | 'Ó'
+            | 'Ô'
+            | 'Õ'
+            | 'Ù'
+            | 'Ú'
+            | 'Ý'
+    )
+}
+
 /// Returns `true` when a single whitespace-delimited token carries an unambiguous
 /// TCVN3 Latin-1 widened marker embedded alongside at least one ASCII letter
 /// (`kh«ng`, `h¬n`, `c×nh`, `KH«NG`).
 ///
 /// # Why
-/// Standalone punctuation or symbols such as `©` (`0xA9` in `"TÒA ÁN © 2026"`)
-/// or the middle dot `·` (`0xB7` in `"TÒA NHÀ · A"`) are valid Unicode separators,
-/// so they must not bypass the Unicode guard unless they are attached to
-/// alphabetic characters within the same token.
+/// Standalone punctuation or symbols such as `©` (`0xA9` in `"TÒA ÁN © 2026"`) or the
+/// middle dot `·` (`0xB7` in `"TÒA NHÀ · A"`) are valid Unicode separators, so they must
+/// not bypass the Unicode guard. The middle dot is also TCVN3 `ã`/`Ã`, so it still counts
+/// when it sits inside a multi-character token built only from TCVN3 letters (`"®·"` is
+/// TCVN3 `"đã"` and has no ASCII letter at all).
 fn token_has_contextual_tcvn3_marker(token: &str) -> bool {
     let word = token.trim_matches(|c: char| c.is_ascii_punctuation());
+    if word.contains('\u{00B7}') && word.chars().count() >= 2 && word.chars().all(is_tcvn3_letter) {
+        return true;
+    }
     if !word.chars().any(|c| c.is_ascii_alphabetic()) {
         return false;
     }
@@ -517,8 +582,8 @@ pub(super) fn has_unambiguous_tcvn3_latin1_markers(s: &str) -> bool {
 
 /// Checks whether a standalone Latin-1 word under a lowercase `.VnTime` hint
 /// violates Vietnamese phonotactics as Unicode while decoding to valid TCVN3:
-/// 1. Mid-word uppercase Latin-1 vowel after lowercase ASCII (`"bÊn"`, `"tÝnh"`, `"vÒ"`),
-///    unless the token already reads as genuine mixed-case Unicode Vietnamese (`"tÔi"`).
+/// 1. Mid-word uppercase Latin-1 vowel after lowercase ASCII (`"bÊn"`, `"tÝnh"`, `"vÒ"`)
+///    unless it opens a Unicode vowel cluster (`"tÔi"` stays, `"nÒn"` decodes to `"nền"`).
 /// 2. Word-initial `{È, Ê, Ì, Ò, Ô, Õ, Ý}` closed by `-p/-t/-c/-ch` (`"Ých"`, `"Ýt"`, `"Êt"`, `"Õp"`),
 ///    which violates Vietnamese checked-syllable tone constraints in Unicode. Acute `É`
 ///    is excluded because `"Ép"`, `"Ét"`, `"Éc"`, `"Éch"` are valid Vietnamese.
@@ -530,20 +595,21 @@ fn is_false_unicode_tcvn3_token(token: &str) -> bool {
         return false;
     }
 
-    // Why: Rule 2a must never rewrite a token that already reads as valid Unicode
-    // Vietnamese in mixed case (`"tÔi"`), where the uppercase vowel is genuine text
-    // rather than a `.VnTime` capital substitution (`"tÔi"` must not become `"tễi"`).
-    if !is_already_unicode_vietnamese(trimmed) {
-        // Rule 2a: Lowercase ASCII followed immediately by an uppercase Latin-1 vowel
-        // (e.g. "bÊn" -> "bến", "tÝnh" -> "tính", "vÒ" -> "về").
-        let mut prev_is_ascii_lower = false;
-        for c in trimmed.chars() {
-            let is_upper_latin1_vowel = matches!(c as u32, 0xC8..=0xCA | 0xCC | 0xD2..=0xD5 | 0xDD);
-            if prev_is_ascii_lower && is_upper_latin1_vowel {
-                return true;
-            }
-            prev_is_ascii_lower = c.is_ascii_lowercase();
+    // Rule 2a: Lowercase ASCII followed immediately by an uppercase Latin-1 vowel
+    // (e.g. "bÊn" -> "bến", "tÝnh" -> "tính", "vÒ" -> "về").
+    // Why: A mixed-case Unicode word such as `"tÔi"` is genuine text only because the
+    // capital vowel opens a valid vowel cluster (`Ôi`); when that same capital is
+    // flanked by consonants (`"nÒn"` = TCVN3 `"nền"`), the capital is a `.VnTime`
+    // substitution and the token must decode. Lowercase ASCII alone cannot tell the
+    // two apart, so the adjacent Unicode vowel does.
+    let mut prev_is_ascii_lower = false;
+    let mut chars = trimmed.chars().peekable();
+    while let Some(c) = chars.next() {
+        let is_upper_latin1_vowel = matches!(c as u32, 0xC8..=0xCA | 0xCC | 0xD2..=0xD5 | 0xDD);
+        if prev_is_ascii_lower && is_upper_latin1_vowel && !chars.peek().is_some_and(|&next| is_unicode_vowel(next)) {
+            return true;
         }
+        prev_is_ascii_lower = c.is_ascii_lowercase();
     }
 
     // Rule 2b: Checked-syllable tone violation on word-initial uppercase Latin-1 vowel.
