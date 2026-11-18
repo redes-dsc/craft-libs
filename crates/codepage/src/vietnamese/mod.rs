@@ -209,6 +209,8 @@ fn transcode_str_inner<'a>(s: &'a str, font_hint: Option<&str>) -> TranscodeResu
 ///
 /// Returns `Cow::Borrowed(s)` with zero allocations when `s` is unchanged (including pure ASCII
 /// for non-`Tcvn3H` hints; a `Tcvn3H` hint allocates `Cow::Owned` when uppercasing lowercase ASCII).
+/// Note that `transcode_vni` may build a temporary byte buffer before returning `Cow::Borrowed(s)`
+/// on pass-through; the strict zero-allocation guarantee applies to the non-`Tcvn3H` ASCII fast path.
 pub fn transcode_vietnamese<'a>(s: &'a str, font_hint: Option<&str>) -> Cow<'a, str> {
     transcode_str_inner(s, font_hint).text
 }
@@ -564,7 +566,7 @@ pub const fn compose_vietnamese_pair(base: char, mark: char) -> Option<char> {
 
 /// Zero-dependency canonical pair composition for the full Windows-1258 character repertoire.
 ///
-/// Extends [`compose_vietnamese_pair`] with the 48 non-Vietnamese Latin base + CP1258 combining
+/// Extends [`compose_vietnamese_pair`] with the 50 non-Vietnamese Latin base + CP1258 combining
 /// mark (`U+0300`, `U+0301`, `U+0303`, `U+0323`) pairs that have precomposed Unicode NFC forms
 /// (such as `n + \u{0303} -> ñ` and `ç + \u{0301} -> ḉ`).
 #[inline]
@@ -583,6 +585,8 @@ pub const fn compose_cp1258_pair(base: char, mark: char) -> Option<char> {
         ('c', '\u{0301}') => '\u{0107}',        // ć
         ('\u{00C7}', '\u{0301}') => '\u{1E08}', // Ḉ
         ('\u{00E7}', '\u{0301}') => '\u{1E09}', // ḉ
+        ('\u{00DC}', '\u{0301}') => '\u{01D7}', // Ǘ (Ü + U+0301)
+        ('\u{00FC}', '\u{0301}') => '\u{01D8}', // ǘ (ü + U+0301, e.g. 0xFC 0xEC)
         ('G', '\u{0301}') => '\u{01F4}',        // Ǵ
         ('g', '\u{0301}') => '\u{01F5}',        // ǵ
         ('K', '\u{0301}') => '\u{1E30}',        // Ḱ
@@ -639,6 +643,72 @@ pub const fn compose_cp1258_pair(base: char, mark: char) -> Option<char> {
     })
 }
 
+/// Canonical combining class of the five combining marks in the CP1258 repertoire.
+///
+/// `U+0323` COMBINING DOT BELOW carries ccc 220, whereas `U+0300`, `U+0301`,
+/// `U+0303` and `U+0309` carry ccc 230, so canonical order puts the dot below first.
+#[inline]
+const fn cp1258_mark_ccc(c: char) -> Option<u8> {
+    match c {
+        '\u{0323}' => Some(220),
+        '\u{0300}' | '\u{0301}' | '\u{0303}' | '\u{0309}' => Some(230),
+        _ => None,
+    }
+}
+
+/// Appends one run of adjacent CP1258 combining marks in canonical combining class order.
+fn push_canonical_cp1258_mark_run(out: &mut String, run: &str) {
+    out.extend(run.chars().filter(|&c| cp1258_mark_ccc(c) == Some(220)));
+    out.extend(run.chars().filter(|&c| cp1258_mark_ccc(c) == Some(230)));
+}
+
+/// Canonicalizes CP1258 combining mark order (ccc 220 dot below `U+0323` before
+/// ccc 230 top accents `U+0300`, `U+0301`, `U+0303`, `U+0309`) prior to pair
+/// composition, so sequences like `0xEC 0xF2 0x41` (`"\u{0301}\u{0323}A"`)
+/// normalize to NFC `"\u{0323}\u{0301}A"`.
+///
+/// Returns `Cow::Borrowed(s)` when every mark run is already in canonical order.
+fn canonicalize_cp1258_mark_order(s: &str) -> Cow<'_, str> {
+    let mut chars = s.chars();
+    let mut prev = chars.next();
+    let mut needs_reorder = false;
+    for c in chars {
+        if prev.is_some_and(|p| cp1258_mark_ccc(p) == Some(230)) && cp1258_mark_ccc(c) == Some(220) {
+            needs_reorder = true;
+            break;
+        }
+        prev = Some(c);
+    }
+    if !needs_reorder {
+        return Cow::Borrowed(s);
+    }
+
+    let mut out = String::with_capacity(s.len());
+    let mut run_start: Option<usize> = None;
+    for (idx, c) in s.char_indices() {
+        match (cp1258_mark_ccc(c).is_some(), run_start) {
+            (true, None) => run_start = Some(idx),
+            (true, Some(_)) => {}
+            (false, Some(start)) => {
+                push_canonical_cp1258_mark_run(&mut out, &s[start..idx]);
+                run_start = None;
+                out.push(c);
+            }
+            (false, None) => out.push(c),
+        }
+    }
+    if let Some(start) = run_start {
+        push_canonical_cp1258_mark_run(&mut out, &s[start..]);
+    }
+    Cow::Owned(out)
+}
+
+/// Composes a CP1258 string to NFC with [`compose_cp1258_pair`].
+#[inline]
+fn normalize_cp1258_composed(s: &str) -> Cow<'_, str> {
+    normalize_with(s, compose_cp1258_pair)
+}
+
 #[inline]
 fn normalize_with<'a>(s: &'a str, composer: fn(char, char) -> Option<char>) -> Cow<'a, str> {
     if s.is_ascii() || !s.chars().any(is_vietnamese_combining_mark) {
@@ -685,7 +755,13 @@ pub fn normalize_nfc<'a>(s: &'a str) -> Cow<'a, str> {
 }
 
 /// Normalize a Windows-1258 decoded string to Unicode Normalization Form C (NFC),
-/// composing both Vietnamese vowels and the 48 non-Vietnamese CP1258 consonant+mark pairs.
+/// composing both Vietnamese vowels and the 50 non-Vietnamese CP1258 component+mark pairs.
+///
+/// Combining marks are first put in Canonical Combining Class order by
+/// [`canonicalize_cp1258_mark_order`], so `U+0323` (ccc 220) precedes `U+0300`,
+/// `U+0301`, `U+0303` and `U+0309` (ccc 230) before pair composition.
+///
+/// Returns `Cow::Borrowed` with zero allocations when the string is ASCII or already composed.
 pub fn normalize_cp1258_nfc<'a>(s: &'a str) -> Cow<'a, str> {
-    normalize_with(s, compose_cp1258_pair)
+    apply_nfc_cow_with(canonicalize_cp1258_mark_order(s), normalize_cp1258_composed)
 }

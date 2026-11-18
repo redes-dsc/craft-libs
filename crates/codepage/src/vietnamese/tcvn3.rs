@@ -468,37 +468,60 @@ pub fn decode_tcvn3(input: &[u8], is_upper: bool, mode: DecodeMode) -> Result<Co
     Ok(Cow::Owned(out))
 }
 
-/// Returns `true` when a Latin-1 widened string contains any of the 41 TCVN3
-/// codepoints in `0xA8..=0xFE` whose Unicode Latin-1 equivalents are NOT valid
-/// Vietnamese letters (`«`, `¬`, `×`, `Ø`, `Ð`, `Þ`, `ß`, `Ç`, `Ü`, `þ`, etc.).
+/// Returns `true` for one of the 41 TCVN3 Latin-1 slots in `0xA8..=0xFE` whose
+/// Unicode Latin-1 equivalents are NOT valid Vietnamese letters (`«`, `¬`, `×`,
+/// `Ø`, `Ð`, `Þ`, `ß`, `Ç`, `Ü`, `þ`, etc.).
+const fn is_unambiguous_tcvn3_latin1_marker(c: char) -> bool {
+    matches!(
+        c as u32,
+        0xA8..=0xAE
+            | 0xB5..=0xB9
+            | 0xBB..=0xBE
+            | 0xC6..=0xC7
+            | 0xCB
+            | 0xCE..=0xD1
+            | 0xD6..=0xD8
+            | 0xDC
+            | 0xDE..=0xDF
+            | 0xE4..=0xE7
+            | 0xEB
+            | 0xEE..=0xF1
+            | 0xF6..=0xF8
+            | 0xFB..=0xFC
+            | 0xFE
+    )
+}
+
+/// Returns `true` when a single whitespace-delimited token carries an unambiguous
+/// TCVN3 Latin-1 widened marker embedded alongside at least one ASCII letter
+/// (`kh«ng`, `h¬n`, `c×nh`, `KH«NG`).
+///
+/// # Why
+/// Standalone punctuation or symbols such as `©` (`0xA9` in `"TÒA ÁN © 2026"`)
+/// or the middle dot `·` (`0xB7` in `"TÒA NHÀ · A"`) are valid Unicode separators,
+/// so they must not bypass the Unicode guard unless they are attached to
+/// alphabetic characters within the same token.
+fn token_has_contextual_tcvn3_marker(token: &str) -> bool {
+    let word = token.trim_matches(|c: char| c.is_ascii_punctuation());
+    if !word.chars().any(|c| c.is_ascii_alphabetic()) {
+        return false;
+    }
+    word.chars().any(is_unambiguous_tcvn3_latin1_marker)
+}
+
+/// Returns `true` when a Latin-1 widened string contains a TCVN3 marker inside an
+/// alphabetic token, per [`token_has_contextual_tcvn3_marker`].
 pub(super) fn has_unambiguous_tcvn3_latin1_markers(s: &str) -> bool {
-    s.chars().any(|c| {
-        matches!(
-            u32::from(c),
-            0xA8..=0xAE
-                | 0xB5..=0xB9
-                | 0xBB..=0xBE
-                | 0xC6..=0xC7
-                | 0xCB
-                | 0xCE..=0xD1
-                | 0xD6..=0xD8
-                | 0xDC
-                | 0xDE..=0xDF
-                | 0xE4..=0xE7
-                | 0xEB
-                | 0xEE..=0xF1
-                | 0xF6..=0xF8
-                | 0xFB..=0xFC
-                | 0xFE
-        )
-    })
+    s.split_whitespace().any(token_has_contextual_tcvn3_marker)
 }
 
 /// Checks whether a standalone Latin-1 word under a lowercase `.VnTime` hint
 /// violates Vietnamese phonotactics as Unicode while decoding to valid TCVN3:
-/// 1. Mid-word uppercase Latin-1 vowel after lowercase ASCII (`"bÊn"`, `"tÝnh"`, `"vÒ"`).
-/// 2. Word-initial `{È, É, Ê, Ì, Ò, Ô, Õ, Ý}` closed by `-p/-t/-c/-ch` (`"Ých"`, `"Ýt"`, `"Êt"`, `"Õp"`),
-///    which violates Vietnamese checked-syllable tone constraints in Unicode.
+/// 1. Mid-word uppercase Latin-1 vowel after lowercase ASCII (`"bÊn"`, `"tÝnh"`, `"vÒ"`),
+///    unless the token already reads as genuine mixed-case Unicode Vietnamese (`"tÔi"`).
+/// 2. Word-initial `{È, Ê, Ì, Ò, Ô, Õ, Ý}` closed by `-p/-t/-c/-ch` (`"Ých"`, `"Ýt"`, `"Êt"`, `"Õp"`),
+///    which violates Vietnamese checked-syllable tone constraints in Unicode. Acute `É`
+///    is excluded because `"Ép"`, `"Ét"`, `"Éc"`, `"Éch"` are valid Vietnamese.
 /// 3. Word-final open `'â'` (`0xE2` -> `'õ'`, e.g. `"gâ"`, `"râ"`, `"ngâ"`), since `'â'` cannot end
 ///    an open syllable in Vietnamese.
 fn is_false_unicode_tcvn3_token(token: &str) -> bool {
@@ -507,24 +530,30 @@ fn is_false_unicode_tcvn3_token(token: &str) -> bool {
         return false;
     }
 
-    // Rule 2a: Lowercase ASCII followed immediately by an uppercase Latin-1 vowel
-    // (e.g. "bÊn" -> "bến", "tÝnh" -> "tính", "vÒ" -> "về").
-    let mut prev_is_ascii_lower = false;
-    for c in trimmed.chars() {
-        let code = u32::from(c);
-        let is_upper_latin1_vowel = matches!(code, 0xC8..=0xCA | 0xCC | 0xD2..=0xD5 | 0xDD);
-        if prev_is_ascii_lower && is_upper_latin1_vowel {
-            return true;
+    // Why: Rule 2a must never rewrite a token that already reads as valid Unicode
+    // Vietnamese in mixed case (`"tÔi"`), where the uppercase vowel is genuine text
+    // rather than a `.VnTime` capital substitution (`"tÔi"` must not become `"tễi"`).
+    if !is_already_unicode_vietnamese(trimmed) {
+        // Rule 2a: Lowercase ASCII followed immediately by an uppercase Latin-1 vowel
+        // (e.g. "bÊn" -> "bến", "tÝnh" -> "tính", "vÒ" -> "về").
+        let mut prev_is_ascii_lower = false;
+        for c in trimmed.chars() {
+            let is_upper_latin1_vowel = matches!(c as u32, 0xC8..=0xCA | 0xCC | 0xD2..=0xD5 | 0xDD);
+            if prev_is_ascii_lower && is_upper_latin1_vowel {
+                return true;
+            }
+            prev_is_ascii_lower = c.is_ascii_lowercase();
         }
-        prev_is_ascii_lower = c.is_ascii_lowercase();
     }
 
-    // Rule 2b: Checked-syllable tone violation on word-initial uppercase Latin-1 vowel
-    // (È, É, Ê, Ì, Ò, Ô, Õ, Ý cannot take -p, -t, -c, -ch codas in Unicode Vietnamese).
+    // Rule 2b: Checked-syllable tone violation on word-initial uppercase Latin-1 vowel.
+    // Why: Vietnamese syllables closed by `-p`, `-t`, `-c`, `-ch` can only carry Sắc
+    // or Nặng, so `È, Ê, Ì, Ò, Ô, Õ, Ý` cannot take those codas. Acute `É` (`0xC9`) is
+    // deliberately absent: `"Ép tôn"` is valid Vietnamese and must stay untouched.
     let mut chars = trimmed.chars();
     if let Some(first) = chars.next() {
         let rest = chars.as_str();
-        let is_non_checked_upper_vowel = matches!(u32::from(first), 0xC8..=0xCA | 0xCC | 0xD2 | 0xD4..=0xD5 | 0xDD);
+        let is_non_checked_upper_vowel = matches!(first as u32, 0xC8 | 0xCA | 0xCC | 0xD2 | 0xD4..=0xD5 | 0xDD);
         if is_non_checked_upper_vowel
             && !rest.is_empty()
             && rest.chars().all(|c| c.is_ascii_alphabetic())

@@ -2,10 +2,10 @@ use std::borrow::Cow;
 
 use super::{
     DecodeError, DecodeMode, DecodeOptions, DetectionResult, EncodingEvidence, EncodingMetadata, LegacyEncoding, VietnameseEncoding, VniDecoder,
-    decode, decode_tcvn3, decode_text, decode_vni, decode_with_mode, detect_encoding, detect_encoding_from_str, detect_legacy_encoding,
-    detect_vietnamese_encoding, font_hint, is_already_unicode_vietnamese, is_legacy_text, is_serif_legacy_font, is_vietnamese_font, normalize_nfc,
-    transcode, transcode_explicit, transcode_summary, transcode_tcvn3, transcode_to_unicode, transcode_vietnamese, transcode_vni,
-    transcode_with_summary, validate_and_normalize,
+    decode, decode_tcvn3, decode_text, decode_vni, decode_windows1258, decode_with_mode, detect_encoding, detect_encoding_from_str,
+    detect_legacy_encoding, detect_vietnamese_encoding, font_hint, is_already_unicode_vietnamese, is_legacy_text, is_serif_legacy_font,
+    is_vietnamese_font, normalize_cp1258_nfc, normalize_nfc, transcode, transcode_explicit, transcode_summary, transcode_tcvn3, transcode_to_unicode,
+    transcode_vietnamese, transcode_vni, transcode_with_summary, validate_and_normalize,
 };
 
 #[test]
@@ -1099,4 +1099,63 @@ fn test_tcvn3_latin1_widened_overlap_and_final_coderabbit_cases() {
     let out = super::transcode_tcvn3_h(emoji);
     assert!(matches!(out, Cow::Borrowed(_)));
     assert_eq!(out, emoji);
+}
+
+#[test]
+fn test_regression_invariants_for_vietnamese_transcoding_and_nfc() {
+    // 1. Why: Standalone copyright (`©` = 0xA9) and middle-dot (`·` = 0xB7) symbols
+    // in genuine Unicode Vietnamese text must NOT bypass the Unicode guard under
+    // `.VnTime` or `.VnTimeH`, whereas markers embedded in an alphabetic token
+    // (`"kh«ng Ýt h¬n"`) still bypass it and decode as TCVN3.
+    assert_eq!(transcode_vietnamese("TÒA ÁN © 2026", Some(".VnTimeH")), "TÒA ÁN © 2026");
+    assert_eq!(transcode_vietnamese("TÒA NHÀ · A", Some(".VnTime")), "TÒA NHÀ · A");
+    assert_eq!(transcode_vietnamese("TÒA NHÀ · A", Some(".VnTimeH")), "TÒA NHÀ · A");
+    assert_eq!(transcode_vietnamese("kh«ng Ýt h¬n", Some(".VnTime")), "không ít hơn");
+
+    // 2. Why: A mixed-case token that already reads as valid Unicode Vietnamese
+    // (`"tÔi"`) must not be rewritten by the mid-word capital rule (`"tễi"`), and a
+    // checked syllable carrying the allowed acute tone (`"Ép tôn"`, `É` = 0xC9 before
+    // `-p`) must stay intact, while genuinely impossible Unicode words (`"Ých"`) and
+    // mid-word TCVN3 capitals (`"bÕn"`) still decode.
+    assert_eq!(transcode_vietnamese("tÔi", Some(".VnTime")), "tÔi");
+    assert_eq!(transcode_vietnamese("Ép tôn", Some(".VnTime")), "Ép tôn");
+    assert_eq!(transcode_vietnamese("Ých", Some(".VnTime")), "ích");
+    assert_eq!(transcode_vietnamese("bÕn", Some(".VnTime")), "bến");
+
+    // 3. Why: Windows-1258 NFC normalization must compose every canonical pair in the
+    // CP1258 repertoire, including `ü + U+0301` -> `ǘ` (`0xFC 0xEC`), while
+    // `decode_windows1258` stays a raw, unnormalized decoding primitive.
+    assert_eq!(decode_windows1258(&[0xFC, 0xEC]).expect("strict CP1258 ü + acute"), "ü\u{0301}");
+    assert_eq!(
+        decode_text(&[0xFC, 0xEC], &DecodeOptions { force_encoding: Some(LegacyEncoding::Windows1258), normalize_nfc: true, ..Default::default() })
+            .expect("CP1258 ǘ"),
+        "ǘ"
+    );
+
+    // 4. Why: Canonical Combining Class order is part of NFC: dot below `U+0323`
+    // (ccc 220) must precede top accents (ccc 230), so `0xEC 0xF2 0x41`
+    // (`"\u{0301}\u{0323}A"`) normalizes to `"\u{0323}\u{0301}A"`.
+    assert_eq!(normalize_cp1258_nfc("\u{0301}\u{0323}A"), "\u{0323}\u{0301}A");
+    assert_eq!(
+        decode_text(
+            &[0xEC, 0xF2, 0x41],
+            &DecodeOptions { force_encoding: Some(LegacyEncoding::Windows1258), normalize_nfc: true, ..Default::default() }
+        )
+        .expect("CP1258 reordered marks"),
+        "\u{0323}\u{0301}A"
+    );
+
+    // 5. Why: An explicit legacy font hint (`.VnTimeH`) overrides container codepage
+    // metadata (1258), and an undecodable VNI coincidence (`0xA7` is invalid in VNI)
+    // must never veto the hint.
+    let meta = EncodingMetadata { font_name: Some(".VnTimeH"), codepage_hint: Some(1258) };
+    let decoded = decode_text(b"Y\xD5N \xA7\xB6O 12345678", &DecodeOptions { metadata: Some(&meta), ..Default::default() })
+        .expect("undecodable VNI coincidence must not override .VnTimeH");
+    assert_eq!(decoded, "YẾN ĐẢO 12345678");
+
+    // 6. Why: AutoCAD `%%%` literal percent escapes and valid inline codes (`%%d`)
+    // keep all-caps inference, while CP1252 fallback characters (`0x9C` -> `œ`)
+    // preserve their original case under `.VnTimeH`.
+    assert_eq!(decode_tcvn3(b"A%%%%%d \xD2", false, DecodeMode::Practical).expect("all-caps with %%%"), "A%%%%%d Ề");
+    assert_eq!(super::transcode_tcvn3_h("b\u{009C}n"), "BœN");
 }
