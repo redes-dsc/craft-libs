@@ -12,8 +12,8 @@ use craft_behavior::{DisplayOrder, ItemSource, Metrics, Selection, TileLayout};
 use craft_theme::Srgba;
 use egui::{Response, Ui, Vec2};
 
-#[cfg(feature = "testing")]
-mod stories;
+#[cfg(feature = "suite")]
+pub(crate) mod stories;
 
 /// The entries of a colour table as an item source: keyed by index, named for type-ahead.
 #[derive(Clone, Copy, Debug)]

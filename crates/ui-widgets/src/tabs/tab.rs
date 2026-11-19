@@ -20,8 +20,8 @@ use craft_behavior::{Flow, IconId, Insets, Metrics, PartKey, PointerButton, Pres
 use craft_theme::{Contrast, Rgba, Stateful, States, TypeRole};
 use egui::{Pos2, Rect, Response, Vec2};
 
-#[cfg(feature = "testing")]
-mod stories;
+#[cfg(feature = "suite")]
+pub(crate) mod stories;
 
 /// What a tab's own parts report, besides what the collection reads from the pointer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

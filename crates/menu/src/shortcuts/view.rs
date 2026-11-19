@@ -7,9 +7,9 @@
 mod bars;
 mod detail;
 mod header;
-#[cfg(feature = "screen-testing")]
-mod stories;
-mod table;
+#[cfg(feature = "suite")]
+pub(crate) mod stories;
+pub(crate) mod table;
 
 use std::borrow::Cow;
 

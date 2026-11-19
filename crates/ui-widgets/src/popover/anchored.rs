@@ -206,5 +206,5 @@ impl Container for Popover<'_> {
     }
 }
 
-#[cfg(feature = "testing")]
-mod stories;
+#[cfg(feature = "suite")]
+pub(crate) mod stories;

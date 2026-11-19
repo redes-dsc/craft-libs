@@ -12,12 +12,12 @@ pub mod ghost;
 mod group;
 mod held;
 mod hosted;
-mod items;
-mod label;
+pub(crate) mod items;
+pub(crate) mod label;
 mod lazy;
-#[cfg(feature = "testing")]
-mod level;
-#[cfg(feature = "testing")]
+#[cfg(feature = "suite")]
+pub(crate) mod level;
+#[cfg(feature = "suite")]
 mod level_table;
 mod looks;
 mod mount;
@@ -87,16 +87,13 @@ pub use label::colon_of;
 pub use label::{CellWidth, FieldLabelRole, FieldLayout, GlyphLabel, InsideLabel, LabelKind, LabelScheme, Scrub, SideLabel};
 pub use lazy::Lazy;
 #[doc(hidden)]
-#[cfg(feature = "testing")]
+#[cfg(feature = "suite")]
 pub use level::{Catalog, CatalogEntry, Level, StoryLayout, Surface, catalog, stale_table_rows, story_title};
 pub use looks::Looks;
 pub use overlay::{Overlay, OverlayUi, Overlays, Popup, PopupHandle, SizeLimits, Trigger};
 pub use pages::Pages;
 pub use paint_ui::PaintUi;
 pub use props::{Common, Props, Resolved, Tooltip, TooltipAt, TooltipSpec, TooltipWhen};
-#[doc(hidden)]
-#[cfg(feature = "testing")]
-pub use registry::registrations;
 #[doc(hidden)]
 pub use registry::{CollectionEntry, ContainerEntry, Exemption, LeafEntry, PatternKind, PatternProbe, Probe, Registration, ShowEntry};
 pub use sampler::{CanvasGesture, Sampler};
@@ -115,7 +112,7 @@ use std::hash::Hash;
 use std::ops::Deref;
 
 pub use crate::runtime::drag::{DragPreview, DropMark, DropTarget, DropZone, OsFile, OsFiles, WindowDropTarget};
-#[cfg(feature = "testing")]
+#[cfg(feature = "suite")]
 pub(crate) use body::MOVE_BAND;
 pub use craft_behavior::ColumnKey;
 pub use craft_behavior::DropOperation;

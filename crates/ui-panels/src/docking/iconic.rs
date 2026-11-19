@@ -26,10 +26,10 @@ use craft_theme::ControlSize;
 use egui::{Id, Pos2, Rect, Response, Ui, Vec2};
 use std::hash::Hash;
 
-#[cfg(feature = "testing")]
-mod stories;
-#[cfg(feature = "testing")]
-mod trials;
+#[cfg(feature = "suite")]
+pub(crate) mod stories;
+#[cfg(feature = "suite")]
+pub(crate) mod trials;
 
 const CELL: PartKey = PartKey::new("cell");
 const NAME: PartKey = PartKey::new("name");

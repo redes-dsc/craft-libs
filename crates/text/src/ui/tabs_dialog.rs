@@ -30,8 +30,8 @@ use egui::Ui;
 use std::borrow::Cow;
 use std::cell::RefCell;
 
-#[cfg(feature = "screen-testing")]
-mod stories;
+#[cfg(feature = "suite")]
+pub(crate) mod stories;
 
 const POSITION: ColumnKey = ColumnKey::new("position");
 const ALIGNMENT: ColumnKey = ColumnKey::new("alignment");

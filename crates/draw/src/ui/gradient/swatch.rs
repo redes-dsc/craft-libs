@@ -10,8 +10,8 @@ use egui::{CornerRadius, Response, Vec2};
 
 use craft_color_ui::ui::gradient::{GradientRamp, GradientStops, Sampler, StopRows, default_sampler};
 
-#[cfg(feature = "screen-testing")]
-mod stories;
+#[cfg(feature = "suite")]
+pub(crate) mod stories;
 
 /// The style of a gradient swatch: the colour swatch's height, corners and ring.
 #[derive(Clone, Debug, PartialEq, ComponentStyle)]

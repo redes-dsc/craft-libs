@@ -20,8 +20,8 @@ use egui::{Response, Ui};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 
-#[cfg(feature = "testing")]
-mod stories;
+#[cfg(feature = "suite")]
+pub(crate) mod stories;
 
 craft_ui::words! {
     /// The standard words of the list manager; the app's own actions bring their labels.

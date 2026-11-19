@@ -22,8 +22,8 @@ use egui::{Response, Ui};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-#[cfg(feature = "testing")]
-mod stories;
+#[cfg(feature = "suite")]
+pub(crate) mod stories;
 
 /// The most commands the empty query lists when the app has run none.
 const FIRST_ROWS: usize = 12;
