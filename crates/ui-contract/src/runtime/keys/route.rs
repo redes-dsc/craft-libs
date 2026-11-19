@@ -539,7 +539,10 @@ fn press_route(ctx: &Context, os: Os, rec: &StopRec, press: &Press, driven: Opti
         // app's.
         None if press.key == Key::Enter && stop.keys.activate.enter() && (plain || !commands::binds_scoped(ctx, &chord)) => PressRoute::Activate,
         None if press.key == Key::Enter && !press.mods.cmd && !press.mods.ctrl => PressRoute::Intent(Intent::Submit),
+        // Space activates only a stop that asks for it with `ActivateKeys::Both` (a reading view turns a column
+        // on Space). Every other stop declares Enter, so Space stays the canvas's Hand key where the app has a canvas.
         None if press.key == Key::Space && plain && stop.keys.activate.space() => PressRoute::Activate,
+        None if press.key == Key::Space => PressRoute::Free,
         None if press.key == Key::Tab && plain && stop.keys.keep == focus::KeepKeys::Tab => PressRoute::Intent(Intent::Tab),
         None if stop.role.nudge => nudge_of(press.key, press.mods).map_or(PressRoute::Free, PressRoute::Nudge),
         None => PressRoute::Free,
